@@ -1550,6 +1550,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "http-body 1.0.1",
  "rustc-hash",
  "serde",
  "thiserror",

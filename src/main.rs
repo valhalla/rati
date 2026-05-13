@@ -170,7 +170,7 @@ async fn get_tile(
     // Must come before gzip — browsers send Accept-Encoding on HEAD too.
     if method == Method::HEAD {
         if raw_gzip || accepts_gzip(&headers) {
-            return tile_head_gzip(&state, tile_id).await.into_response();
+            return tile_head_gzip(&state, tile_id).into_response();
         }
         return tile_head(&state, tile_id).into_response();
     }
@@ -207,7 +207,7 @@ async fn get_tile_by_id(
 
     if method == Method::HEAD {
         if accepts_gzip(&headers) {
-            return tile_head_gzip(&state, tile_id).await.into_response();
+            return tile_head_gzip(&state, tile_id).into_response();
         }
         return tile_head(&state, tile_id).into_response();
     }
@@ -245,40 +245,23 @@ async fn gzip_tile(
     tile_id: archive::TileId,
 ) -> Result<impl IntoResponse, StatusCode> {
     let data = get_tile_data(state, tile_id).await?;
-    let compressed = gzip_compress(&data);
-    state
-        .archive
-        .cache_tile_gz_size(tile_id, compressed.len() as u32);
     Ok((
         [(axum::http::header::CONTENT_ENCODING, "gzip")],
-        Bytes::from(compressed),
+        Bytes::from(gzip_compress(&data)),
     ))
 }
 
-/// HEAD for gzip tiles: return cached compressed size, or fetch+compress once to measure it.
-async fn tile_head_gzip(
+/// HEAD for gzip-encoded responses: only confirm the tile exists. No `Content-Length` —
+/// we'd have to fetch and compress just to measure it, which defeats the point of HEAD.
+fn tile_head_gzip(
     state: &AppState,
     tile_id: archive::TileId,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let cached = state
+    state
         .archive
-        .tile_gz_size(tile_id)
+        .tile_size(tile_id)
         .ok_or(StatusCode::NOT_FOUND)?;
-
-    let size = if cached != 0 {
-        cached
-    } else {
-        // Cache miss — fetch, compress, cache the size, discard the bytes
-        let data = get_tile_data(state, tile_id).await?;
-        let gz_size = gzip_compress(&data).len() as u32;
-        state.archive.cache_tile_gz_size(tile_id, gz_size);
-        gz_size
-    };
-
-    Ok([
-        (axum::http::header::CONTENT_LENGTH, size.to_string()),
-        (axum::http::header::CONTENT_ENCODING, "gzip".to_string()),
-    ])
+    Ok([(axum::http::header::CONTENT_ENCODING, "gzip")])
 }
 
 /// Per RFC 9110 §13.1.2, returns `true` if any ETag in `If-None-Match` matches

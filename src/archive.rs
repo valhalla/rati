@@ -6,8 +6,6 @@
 //! 1. Fetch bytes [0, 512) — the first tar header — and verify it's `index.bin`.
 //! 2. Fetch bytes [512, 512 + size) — the raw index data — and parse it.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -89,8 +87,6 @@ impl TileIndexEntry {
 struct TileEntry {
     offset: u64,
     size: u32,
-    /// Gzip-compressed size, lazily evaluated on first gzip HEAD request. 0 means "not yet computed".
-    gz_size: AtomicU32,
 }
 
 type TileIndex = FxHashMap<TileId, TileEntry>;
@@ -114,7 +110,6 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
             TileEntry {
                 offset: e.offset,
                 size: e.size,
-                gz_size: AtomicU32::new(0),
             },
         );
     }
@@ -370,20 +365,6 @@ impl S3Archive {
     pub fn tile_size(&self, tile_id: TileId) -> Option<u32> {
         self.index.get(&tile_id).map(|e| e.size)
     }
-
-    /// Returns the cached gzip-compressed size, or 0 if not yet computed.
-    pub fn tile_gz_size(&self, tile_id: TileId) -> Option<u32> {
-        self.index
-            .get(&tile_id)
-            .map(|e| e.gz_size.load(Ordering::Relaxed))
-    }
-
-    /// Cache the gzip-compressed size for a tile. Benign race on concurrent writes.
-    pub fn cache_tile_gz_size(&self, tile_id: TileId, size: u32) {
-        if let Some(e) = self.index.get(&tile_id) {
-            e.gz_size.store(size, Ordering::Relaxed);
-        }
-    }
 }
 
 async fn get_range(
@@ -509,7 +490,6 @@ async fn scan_tar_headers(
                     TileEntry {
                         offset: data_offset,
                         size: data_size as u32,
-                        gz_size: AtomicU32::new(0),
                     },
                 );
                 if entries.len() % 1000 == 0 {
@@ -732,7 +712,7 @@ mod tests {
         let e1 = &index[&TileId::new(0x005B1B0A)];
         assert_eq!((e1.offset, e1.size), (5000000, 12345));
 
-        assert!(index.get(&TileId::new(0xDEAD)).is_none());
+        assert!(!index.contains_key(&TileId::new(0xDEAD)));
     }
 
     #[test]

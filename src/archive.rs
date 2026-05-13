@@ -1,10 +1,18 @@
 //! S3-backed tar archive: index parsing, tile lookups, and S3 I/O.
 //!
 //! Loads the tar index from an S3 object via range requests, then serves individual
-//! tiles by reading their byte ranges on demand. Follows the same two-step protocol
-//! as Valhalla's `GraphReader::load_remote_tar_offsets()`:
-//! 1. Fetch bytes [0, 512) — the first tar header — and verify it's `index.bin`.
-//! 2. Fetch bytes [512, 512 + size) — the raw index data — and parse it.
+//! tiles by reading their byte ranges on demand. Startup performs a handful of small
+//! range reads against S3 — no full download:
+//!
+//! 1. `HeadObject` for ETag, Last-Modified, and total size.
+//! 2. First 512 bytes — the leading tar header, expected to name `index.bin`. If it
+//!    doesn't and `--scan-index` is set, fall back to [`scan_tar_headers`] which walks
+//!    the whole archive in 8 MB chunks with prefetch.
+//! 3. The `index.bin` payload — parsed into a `TileId → (offset, size)` map.
+//! 4. One more 512-byte header read to detect tile compression from the first tile's
+//!    filename suffix ([`detect_compression`]).
+//! 5. A 272-byte read (or the full first tile when it's compressed) to extract the
+//!    dataset id from the `GraphTileHeader` ([`detect_dataset_id`]).
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
@@ -37,23 +45,60 @@ impl TileId {
 
     /// Parse a Valhalla tile path like `2/000/818/660.gph` into a packed ID.
     ///
-    /// Mirrors `get_tile_id()` from `valhalla_build_extract`:
-    /// strip extension, split off level, join remaining digits → `level | (index << 3)`.
-    ///
-    /// Accepts any single extension (`.gph`, `.csv`, `.spd`, etc.) or no extension at all.
-    /// The extension is not validated — the caller decides what content type is expected.
+    /// Mirrors `get_tile_id()` from `valhalla_build_extract`: split off level, drop any
+    /// suffix from the tail, join the remaining digits → `level | (index << 3)`. Numeric
+    /// tile names don't contain dots, so the first dot anywhere after the level is the
+    /// start of the suffix(es) (`.gph`, `.gph.zst`, etc.).
     pub fn from_path(path: &str) -> Option<Self> {
-        // Strip any single extension: find the last '.' that comes after the last '/'
-        let last_slash = path.rfind('/').unwrap_or(0);
-        let stem = match path[last_slash..].rfind('.') {
-            Some(dot_pos) => &path[..last_slash + dot_pos],
-            None => path,
-        };
-
-        let (level_str, idx_str) = stem.split_once('/')?;
+        let (level_str, rest) = path.split_once('/')?;
         let level: u32 = level_str.parse().ok()?;
-        let tile_index: u32 = idx_str.replace('/', "").parse().ok()?;
+        let digits = rest.split_once('.').map_or(rest, |(head, _)| head);
+        let tile_index: u32 = digits.replace('/', "").parse().ok()?;
         Some(Self(level | (tile_index << 3)))
+    }
+}
+
+/// Compression applied to each tile entry inside the tar. Uniform across an archive — detected
+/// once at startup from the first tile's filename suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileCompression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+impl TileCompression {
+    fn from_name(name: &str) -> Self {
+        if name.ends_with(".zst") {
+            Self::Zstd
+        } else if name.ends_with(".gz") {
+            Self::Gzip
+        } else {
+            Self::None
+        }
+    }
+
+    /// IANA token used on the wire in `Accept-Encoding` / `Content-Encoding`.
+    /// [`Self::None`] returns the conventional `"identity"`; callers emitting
+    /// `Content-Encoding` should suppress the header in that case rather than
+    /// sending `identity` (which is redundant).
+    pub const fn header_name(self) -> &'static str {
+        match self {
+            Self::None => "identity",
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+impl std::fmt::Display for TileCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Use a friendlier label for `None` in logs; the HTTP token is "identity"
+        // (see [`Self::header_name`]) but reads oddly outside an HTTP context.
+        f.write_str(match self {
+            Self::None => "none",
+            other => other.header_name(),
+        })
     }
 }
 
@@ -223,6 +268,7 @@ pub struct S3Archive {
     bucket: Box<str>,
     key: Box<str>,
     index: TileIndex,
+    compression: TileCompression,
 }
 
 impl S3Archive {
@@ -284,11 +330,16 @@ impl S3Archive {
             .try_into()
             .map_err(|_| S3Error::Protocol("tar header shorter than 512 bytes".into()))?;
 
-        // Step 2: Try to load index.bin; fall back to tar scan if missing and --scan-index is set
-        let index = match read_index_header(header) {
+        // Step 2: Try to load index.bin; fall back to tar scan if missing and --scan-index is set.
+        // The scan path sees filenames directly and detects compression inline; the index.bin
+        // path requires an extra 512-byte range request afterwards to read the first tile's
+        // tar header.
+        let (index, compression) = match read_index_header(header) {
             Ok((data_offset, data_size)) => {
                 let index_bytes = get_range(&client, bucket, key, data_offset, data_size).await?;
-                parse_index(&index_bytes).map_err(S3Error::Tar)?
+                let index = parse_index(&index_bytes).map_err(S3Error::Tar)?;
+                let compression = detect_compression(&client, bucket, key, &index).await?;
+                (index, compression)
             }
             Err(TarError::FirstEntryNotIndex { .. }) if scan_index => {
                 tracing::warn!(
@@ -303,13 +354,15 @@ impl S3Archive {
             Err(e) => return Err(S3Error::Tar(e)),
         };
 
+        tracing::info!("Tile compression: {compression}");
+
         // Step 3: Determine the dataset ID
         let dataset_id: Box<str> = if let Some(override_id) = dataset_id_override {
             tracing::info!("Using CLI-provided dataset ID: {override_id}");
             override_id.into()
         } else {
             // Try to auto-detect from the first tile's GraphTileHeader
-            match detect_dataset_id(&client, bucket, key, &index).await {
+            match detect_dataset_id(&client, bucket, key, &index, compression).await {
                 Ok(id) => {
                     tracing::info!("Auto-detected dataset ID from graph tile header: {id}");
                     id.to_string().into()
@@ -332,6 +385,7 @@ impl S3Archive {
             bucket: bucket.into(),
             key: key.into(),
             index,
+            compression,
         };
 
         let meta = ArchiveMeta {
@@ -344,13 +398,14 @@ impl S3Archive {
         Ok((archive, meta))
     }
 
-    /// Fetch a tile by its ID. Returns `None` if the tile is not in the index.
+    /// Fetch a tile's on-disk bytes — exactly what's stored in the tar, compressed or not.
+    /// Callers inspect [`compression`](Self::compression) to decide whether to decode.
+    /// Returns `None` if the tile is not in the index.
     pub async fn get_tile(&self, tile_id: TileId) -> Result<Option<Bytes>, S3Error> {
         let Some(entry) = self.index.get(&tile_id) else {
             return Ok(None);
         };
-
-        let data = get_range(
+        let raw = get_range(
             &self.client,
             &self.bucket,
             &self.key,
@@ -358,12 +413,38 @@ impl S3Archive {
             entry.size as u64,
         )
         .await?;
-        Ok(Some(data))
+        Ok(Some(raw))
     }
 
-    /// Returns the uncompressed tile size from the index, or `None` if the tile doesn't exist.
+    /// Returns the on-disk tile size from the index, or `None` if the tile doesn't exist.
+    /// For compressed archives this is the compressed size, not the size the client receives.
     pub fn tile_size(&self, tile_id: TileId) -> Option<u32> {
         self.index.get(&tile_id).map(|e| e.size)
+    }
+
+    /// Compression scheme used for tiles inside this archive.
+    pub fn compression(&self) -> TileCompression {
+        self.compression
+    }
+}
+
+/// Decompress `data` according to `compression`. Returns the input unchanged for `TileCompression::None`.
+pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<Bytes> {
+    use std::io::Read;
+    match compression {
+        TileCompression::None => Ok(data),
+        TileCompression::Gzip => {
+            let mut decoder = flate2::read::GzDecoder::new(data.as_ref());
+            let mut out = Vec::with_capacity(data.len() * 3);
+            decoder.read_to_end(&mut out)?;
+            Ok(Bytes::from(out))
+        }
+        TileCompression::Zstd => {
+            let mut decoder = zstd::stream::Decoder::new(data.as_ref())?;
+            let mut out = Vec::with_capacity(data.len() * 4);
+            decoder.read_to_end(&mut out)?;
+            Ok(Bytes::from(out))
+        }
     }
 }
 
@@ -408,7 +489,7 @@ async fn scan_tar_headers(
     bucket: &str,
     key: &str,
     archive_size: u64,
-) -> Result<TileIndex, S3Error> {
+) -> Result<(TileIndex, TileCompression), S3Error> {
     use futures_util::{StreamExt, stream};
 
     // Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
@@ -426,6 +507,7 @@ async fn scan_tar_headers(
         .buffered(PREFETCH);
 
     let mut entries = FxHashMap::default();
+    let mut compression = TileCompression::None;
     let mut pos: u64 = 0;
 
     // Current chunk and its position within the archive
@@ -485,6 +567,9 @@ async fn scan_tar_headers(
                     header.name,
                 );
             } else {
+                if entries.is_empty() {
+                    compression = TileCompression::from_name(&header.name);
+                }
                 entries.insert(
                     tile_id,
                     TileEntry {
@@ -509,13 +594,43 @@ async fn scan_tar_headers(
     entries.shrink_to_fit();
 
     tracing::info!("Built index from tar scan: {} tiles", entries.len());
-    Ok(entries)
+    Ok((entries, compression))
+}
+
+/// Read the tar header of the first tile listed in `index` and detect compression from its name.
+///
+/// Index entries store only `tile_id`, not filenames, so we need one additional 512-byte range
+/// request to recover the name. The tar header sits 512 bytes before the tile data.
+async fn detect_compression(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    index: &TileIndex,
+) -> Result<TileCompression, S3Error> {
+    let Some(entry) = index.values().next() else {
+        return Ok(TileCompression::None); // no tiles - no compression
+    };
+    let header_bytes = get_range(
+        client,
+        bucket,
+        key,
+        entry.offset - TAR_BLOCK_SIZE as u64,
+        TAR_BLOCK_SIZE as u64,
+    )
+    .await?;
+    let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| S3Error::Protocol("tile header shorter than 512 bytes".into()))?;
+    let parsed = TarHeader::parse(header).map_err(S3Error::Tar)?;
+    Ok(TileCompression::from_name(&parsed.name))
 }
 
 /// Try to detect the dataset ID by reading the first tile's `GraphTileHeader`.
 ///
-/// Picks an arbitrary tile from the index, reads the first 272 bytes (the header),
-/// and extracts the `dataset_id` field (`u64` at byte offset 32).
+/// Picks an arbitrary tile from the index, reads its first 272 bytes (the header),
+/// and extracts the `dataset_id` field (`u64` at byte offset 32). For compressed
+/// archives the whole tile is fetched and decompressed first.
 ///
 /// Returns an error if no tiles are in the index, the tile is too small, or
 /// the `dataset_id` field is zero (likely not a graph tile).
@@ -524,22 +639,32 @@ async fn detect_dataset_id(
     bucket: &str,
     key: &str,
     index: &TileIndex,
+    compression: TileCompression,
 ) -> Result<u64, S3Error> {
     let entry = index
         .values()
         .next()
         .ok_or_else(|| S3Error::Protocol("no tiles in index to read header from".into()))?;
 
-    // We need at least GRAPH_TILE_HEADER_SIZE bytes from the tile
-    let read_size = GRAPH_TILE_HEADER_SIZE as u64;
-    if (entry.size as u64) < read_size {
-        return Err(S3Error::Protocol(format!(
-            "tile is only {} bytes, too small for GraphTileHeader ({} bytes)",
-            entry.size, GRAPH_TILE_HEADER_SIZE
-        )));
-    }
-
-    let data = get_range(client, bucket, key, entry.offset, read_size).await?;
+    // For plain tiles we only need the first 272 bytes; for compressed tiles we have
+    // to fetch and decompress the whole thing to read any prefix of the plain data.
+    let data = match compression {
+        TileCompression::None => {
+            let read_size = GRAPH_TILE_HEADER_SIZE as u64;
+            if (entry.size as u64) < read_size {
+                return Err(S3Error::Protocol(format!(
+                    "tile is only {} bytes, too small for GraphTileHeader ({} bytes)",
+                    entry.size, GRAPH_TILE_HEADER_SIZE
+                )));
+            }
+            get_range(client, bucket, key, entry.offset, read_size).await?
+        }
+        _ => {
+            let raw = get_range(client, bucket, key, entry.offset, entry.size as u64).await?;
+            decompress(raw, compression)
+                .map_err(|e| S3Error::Protocol(format!("decode tile for dataset_id: {e}")))?
+        }
+    };
     let dataset_id = parse_dataset_id(&data)?;
 
     if dataset_id == 0 {
@@ -674,6 +799,13 @@ mod tests {
         let id = TileId::from_path("0/000/529").unwrap();
         assert_eq!(id.0, 529 << 3);
 
+        // compression suffix on top of an extension
+        let id = TileId::from_path("2/000/818/660.gph.zst").unwrap();
+        assert_eq!(id.0, 2 | (818660 << 3));
+
+        let id = TileId::from_path("2/000/818/660.gph.gz").unwrap();
+        assert_eq!(id.0, 2 | (818660 << 3));
+
         // invalid
         assert!(TileId::from_path("").is_none());
         assert!(TileId::from_path("660.gph").is_none());
@@ -713,6 +845,47 @@ mod tests {
         assert_eq!((e1.offset, e1.size), (5000000, 12345));
 
         assert!(!index.contains_key(&TileId::new(0xDEAD)));
+    }
+
+    #[test]
+    fn detect_compression_from_name() {
+        assert_eq!(
+            TileCompression::from_name("2/000/818/660.gph"),
+            TileCompression::None
+        );
+        assert_eq!(
+            TileCompression::from_name("2/000/818/660.gph.gz"),
+            TileCompression::Gzip
+        );
+        assert_eq!(
+            TileCompression::from_name("2/000/818/660.gph.zst"),
+            TileCompression::Zstd
+        );
+        assert_eq!(
+            TileCompression::from_name("index.bin"),
+            TileCompression::None
+        );
+    }
+
+    #[test]
+    fn decompress_round_trips() {
+        let plain = b"some tile bytes - graph header would go here".repeat(8);
+
+        // None: passthrough
+        let out = decompress(Bytes::copy_from_slice(&plain), TileCompression::None).unwrap();
+        assert_eq!(out.as_ref(), plain.as_slice());
+
+        // Gzip
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &plain).unwrap();
+        let gz = enc.finish().unwrap();
+        let out = decompress(Bytes::from(gz), TileCompression::Gzip).unwrap();
+        assert_eq!(out.as_ref(), plain.as_slice());
+
+        // Zstd
+        let zst = zstd::encode_all(plain.as_slice(), 3).unwrap();
+        let out = decompress(Bytes::from(zst), TileCompression::Zstd).unwrap();
+        assert_eq!(out.as_ref(), plain.as_slice());
     }
 
     #[test]

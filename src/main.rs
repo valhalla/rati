@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::get,
@@ -18,6 +18,8 @@ use tokio::signal;
 use tracing::info;
 
 mod archive;
+
+use archive::TileCompression;
 
 #[derive(Parser)]
 struct Config {
@@ -157,42 +159,18 @@ async fn get_tile(
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let (path, raw_gzip) = match path.strip_suffix(".gz") {
-        Some(base) => (base, true),
-        None => (path.as_str(), false),
-    };
-
-    let Some(tile_id) = archive::TileId::from_path(path) else {
+    let Some(tile_id) = archive::TileId::from_path(&path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // HEAD: return Content-Length without fetching from S3.
-    // Must come before gzip — browsers send Accept-Encoding on HEAD too.
+    let response_encoding = pick_response_encoding(&headers, state.archive.compression());
+
     if method == Method::HEAD {
-        if raw_gzip || accepts_gzip(&headers) {
-            return tile_head_gzip(&state, tile_id).into_response();
-        }
-        return tile_head(&state, tile_id).into_response();
+        return tile_head(&state, tile_id, response_encoding);
     }
-
-    // Mode 2: `.gz` extension — raw gzip file, no Content-Encoding
-    if raw_gzip {
-        return get_tile_data(&state, tile_id)
-            .await
-            .map(|data| Bytes::from(gzip_compress(&data)))
-            .into_response();
-    }
-
-    // Mode 1: `Accept-Encoding: gzip` — compress on the fly with Content-Encoding
-    if accepts_gzip(&headers) {
-        return gzip_tile(&state, tile_id).await.into_response();
-    }
-
-    get_tile_data(&state, tile_id).await.into_response()
+    serve_tile(&state, tile_id, response_encoding).await
 }
 
-/// Supports `Accept-Encoding: gzip` (mode 1) but not `.gz` extension (mode 2),
-/// because numeric IDs have no file extension to append `.gz` to.
 async fn get_tile_by_id(
     method: Method,
     State(state): State<AppState>,
@@ -204,100 +182,169 @@ async fn get_tile_by_id(
     }
 
     let tile_id = archive::TileId::new(tile_id);
+    let response_encoding = pick_response_encoding(&headers, state.archive.compression());
 
     if method == Method::HEAD {
-        if accepts_gzip(&headers) {
-            return tile_head_gzip(&state, tile_id).into_response();
-        }
-        return tile_head(&state, tile_id).into_response();
+        return tile_head(&state, tile_id, response_encoding);
     }
-
-    if accepts_gzip(&headers) {
-        return gzip_tile(&state, tile_id).await.into_response();
-    }
-
-    get_tile_data(&state, tile_id).await.into_response()
+    serve_tile(&state, tile_id, response_encoding).await
 }
 
-/// HEAD for plain tiles: return Content-Length from the index without fetching from S3.
-fn tile_head(state: &AppState, tile_id: archive::TileId) -> Result<impl IntoResponse, StatusCode> {
-    let size = state
-        .archive
-        .tile_size(tile_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok([(axum::http::header::CONTENT_LENGTH, size.to_string())])
+/// Body that yields nothing and reports unknown size, so hyper doesn't auto-emit
+/// `Content-Length: 0` from the size hint. Used for HEAD responses where we want
+/// to omit `Content-Length` (the index size doesn't match what GET would return).
+struct EmptyUnknownSize;
+
+impl http_body::Body for EmptyUnknownSize {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::default()
+    }
 }
 
-async fn get_tile_data(state: &AppState, tile_id: archive::TileId) -> Result<Bytes, StatusCode> {
-    match state.archive.get_tile(tile_id).await {
-        Ok(Some(data)) => Ok(data),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
+/// HEAD: never fetch tile bytes. Set `Content-Encoding` for compressed responses,
+/// and advertise `Content-Length` only when the response encoding matches what's
+/// already on disk — that's the only case where the index size equals the body size
+/// we'd send.
+///
+/// The body is [`EmptyUnknownSize`] rather than [`axum::body::Body::empty`] so hyper
+/// doesn't auto-emit `Content-Length: 0` from the body's exact size hint when we
+/// deliberately want the header omitted.
+fn tile_head(
+    state: &AppState,
+    tile_id: archive::TileId,
+    response_encoding: TileCompression,
+) -> Response {
+    let Some(size) = state.archive.tile_size(tile_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut response = Response::new(axum::body::Body::new(EmptyUnknownSize));
+    let h = response.headers_mut();
+    if response_encoding != TileCompression::None {
+        h.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(response_encoding.header_name()),
+        );
+    }
+    if response_encoding == state.archive.compression() {
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    }
+    response
+}
+
+/// GET: fetch the tile and produce bytes in the negotiated encoding. Pass-through when
+/// the on-disk encoding already matches; otherwise decompress to plain and re-encode.
+async fn serve_tile(
+    state: &AppState,
+    tile_id: archive::TileId,
+    response_encoding: TileCompression,
+) -> Response {
+    let tile = match state.archive.get_tile(tile_id).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(tile_id = %tile_id, "S3 error: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let compression = state.archive.compression();
+    let body = if compression == response_encoding {
+        tile
+    } else {
+        let plain = match archive::decompress(tile, compression) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(tile_id = %tile_id, "decode error: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        match response_encoding {
+            TileCompression::None => plain,
+            TileCompression::Gzip => Bytes::from(gzip_compress(&plain)),
+            TileCompression::Zstd => Bytes::from(zstd_compress(&plain)),
+        }
+    };
+
+    let mut response = body.into_response();
+    if response_encoding != TileCompression::None {
+        response.headers_mut().insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(response_encoding.header_name()),
+        );
+    }
+    response
+}
+
+/// Pick the response encoding from `Accept-Encoding` and the on-disk compression.
+///
+/// Single pass over the header populates `(zstd_ok, gzip_ok)`; the decision then
+/// mirrors the negotiation table:
+/// - Source matches an accepted encoding → pass through (no decode, no re-encode).
+/// - Otherwise pick the best accepted encoding, preferring zstd over gzip.
+/// - Nothing matches → plain.
+fn pick_response_encoding(headers: &HeaderMap, source: TileCompression) -> TileCompression {
+    use TileCompression::*;
+
+    const ZSTD: &str = TileCompression::Zstd.header_name();
+    const GZIP: &str = TileCompression::Gzip.header_name();
+
+    let mut zstd_ok = false;
+    let mut gzip_ok = false;
+    if let Some(accept) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        for token in accept.split(',') {
+            let token = token.trim();
+            let (name, params) = token.split_once(';').unwrap_or((token, ""));
+            // Per RFC 7231 §5.3.4: `<encoding>;q=0` rejects the encoding.
+            let rejected = params.split(';').any(|p| {
+                p.trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
+            });
+            if rejected {
+                continue;
+            }
+            if name.eq_ignore_ascii_case(ZSTD) {
+                zstd_ok = true;
+            } else if name.eq_ignore_ascii_case(GZIP) {
+                gzip_ok = true;
+            }
         }
     }
-}
 
-/// Compress tile on the fly and set `Content-Encoding: gzip`.
-async fn gzip_tile(
-    state: &AppState,
-    tile_id: archive::TileId,
-) -> Result<impl IntoResponse, StatusCode> {
-    let data = get_tile_data(state, tile_id).await?;
-    Ok((
-        [(axum::http::header::CONTENT_ENCODING, "gzip")],
-        Bytes::from(gzip_compress(&data)),
-    ))
-}
-
-/// HEAD for gzip-encoded responses: only confirm the tile exists. No `Content-Length` —
-/// we'd have to fetch and compress just to measure it, which defeats the point of HEAD.
-fn tile_head_gzip(
-    state: &AppState,
-    tile_id: archive::TileId,
-) -> Result<impl IntoResponse, StatusCode> {
-    state
-        .archive
-        .tile_size(tile_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok([(axum::http::header::CONTENT_ENCODING, "gzip")])
+    match (source, zstd_ok, gzip_ok) {
+        (Zstd, true, _) => Zstd,  // passthrough
+        (Gzip, _, true) => Gzip,  // passthrough
+        (_, true, _) => Zstd,     // re-encode, prefer zstd
+        (_, false, true) => Gzip, // re-encode to gzip
+        _ => None,
+    }
 }
 
 /// Per RFC 9110 §13.1.2, returns `true` if any ETag in `If-None-Match` matches
 /// (or the wildcard `*` is present), meaning the server should respond with 304.
 fn is_not_modified(request_headers: &HeaderMap, etag: &str) -> bool {
     request_headers
-        .get(axum::http::header::IF_NONE_MATCH)
+        .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split(',').any(|part| {
                 let part = part.trim();
                 part == "*" || part == etag
-            })
-        })
-}
-
-/// Per RFC 7231 section 5.3.4, `gzip;q=0` means gzip is explicitly unacceptable.
-fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',').any(|part| {
-                let part = part.trim();
-                if !part.starts_with("gzip") {
-                    return false;
-                }
-                let after_gzip = &part["gzip".len()..];
-                if after_gzip.is_empty() {
-                    return true;
-                }
-                if let Some(rest) = after_gzip.strip_prefix(";q=") {
-                    rest.trim().parse::<f32>().unwrap_or(1.0) > 0.0
-                } else {
-                    true
-                }
             })
         })
 }
@@ -311,27 +358,28 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish on Vec cannot fail")
 }
 
+fn zstd_compress(data: &[u8]) -> Vec<u8> {
+    zstd::encode_all(data, 0).expect("zstd encode to Vec cannot fail")
+}
+
 /// Derived once at startup; the `set_cache_headers` middleware merges these into every tile response.
 fn build_cache_headers(meta: &archive::ArchiveMeta, cache_max_age: u32) -> HeaderMap {
     let mut headers = HeaderMap::with_capacity(8);
 
     if let Ok(val) = HeaderValue::from_str(&meta.etag) {
-        headers.insert(axum::http::header::ETAG, val);
+        headers.insert(header::ETAG, val);
     }
 
     if let Ok(val) = HeaderValue::from_str(&meta.last_modified) {
-        headers.insert(axum::http::header::LAST_MODIFIED, val);
+        headers.insert(header::LAST_MODIFIED, val);
     }
 
     let cache_control = format!("public, max-age={cache_max_age}, immutable");
     if let Ok(val) = HeaderValue::from_str(&cache_control) {
-        headers.insert(axum::http::header::CACHE_CONTROL, val);
+        headers.insert(header::CACHE_CONTROL, val);
     }
 
-    headers.insert(
-        axum::http::header::VARY,
-        HeaderValue::from_static("Accept-Encoding"),
-    );
+    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
 
     if let Ok(val) = HeaderValue::from_str(&meta.dataset_id) {
         headers.insert("X-Dataset-Id", val);
@@ -354,19 +402,16 @@ mod tests {
         };
         let headers = build_cache_headers(&meta, 3600);
 
-        assert_eq!(headers.get(axum::http::header::ETAG).unwrap(), "\"abc123\"");
+        assert_eq!(headers.get(header::ETAG).unwrap(), "\"abc123\"");
         assert_eq!(
-            headers.get(axum::http::header::LAST_MODIFIED).unwrap(),
+            headers.get(header::LAST_MODIFIED).unwrap(),
             "Thu, 17 Apr 2025 12:00:00 GMT"
         );
         assert_eq!(
-            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            headers.get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=3600, immutable"
         );
-        assert_eq!(
-            headers.get(axum::http::header::VARY).unwrap(),
-            "Accept-Encoding"
-        );
+        assert_eq!(headers.get(header::VARY).unwrap(), "Accept-Encoding");
         assert_eq!(headers.get("X-Dataset-Id").unwrap(), "42");
     }
 
@@ -381,7 +426,7 @@ mod tests {
         let headers = build_cache_headers(&meta, 86400);
 
         assert_eq!(
-            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            headers.get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=86400, immutable"
         );
     }
@@ -397,7 +442,7 @@ mod tests {
         let headers = build_cache_headers(&meta, 0);
 
         assert_eq!(
-            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            headers.get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=0, immutable"
         );
     }
@@ -406,10 +451,7 @@ mod tests {
     fn is_not_modified_test() {
         let with = |val: &'static str| {
             let mut h = HeaderMap::new();
-            h.insert(
-                axum::http::header::IF_NONE_MATCH,
-                HeaderValue::from_static(val),
-            );
+            h.insert(header::IF_NONE_MATCH, HeaderValue::from_static(val));
             h
         };
         let etag = "\"abc123\"";
@@ -425,28 +467,44 @@ mod tests {
         assert!(!is_not_modified(&with("\"abc123-modified\""), etag));
     }
 
+    fn with_accept_encoding(val: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(val));
+        h
+    }
+
     #[test]
-    fn accepts_gzip_test() {
-        let with = |val: &'static str| {
-            let mut h = HeaderMap::new();
-            h.insert(
-                axum::http::header::ACCEPT_ENCODING,
-                HeaderValue::from_static(val),
-            );
-            h
-        };
+    fn pick_response_encoding_test() {
+        use TileCompression::*;
+        let pick = |hdr, src| pick_response_encoding(&with_accept_encoding(hdr), src);
 
-        // Accepts
-        assert!(accepts_gzip(&with("gzip, deflate, br")));
-        assert!(accepts_gzip(&with("gzip")));
-        assert!(accepts_gzip(&with("gzip;q=1.0, deflate;q=0.5")));
-        assert!(accepts_gzip(&with("gzip;q=0.5")));
+        // Passthrough wins, even when other encodings are accepted.
+        assert_eq!(pick("gzip, zstd", Gzip), Gzip);
+        assert_eq!(pick("gzip, zstd", Zstd), Zstd);
+        assert_eq!(pick("gzip", Gzip), Gzip);
+        assert_eq!(pick("zstd", Zstd), Zstd);
 
-        // Rejects
-        assert!(!accepts_gzip(&with("deflate, br")));
-        assert!(!accepts_gzip(&HeaderMap::new()));
-        assert!(!accepts_gzip(&with("gzip;q=0, deflate")));
-        assert!(!accepts_gzip(&with("gzip;q=0.0")));
+        // Plain source: prefer zstd over gzip.
+        assert_eq!(pick("gzip, zstd", None), Zstd);
+        assert_eq!(pick("gzip", None), Gzip);
+        assert_eq!(pick("zstd", None), Zstd);
+
+        // Re-encode when source isn't accepted.
+        assert_eq!(pick("gzip", Zstd), Gzip);
+        assert_eq!(pick("zstd", Gzip), Zstd);
+
+        // q=0 rejects.
+        assert_eq!(pick("gzip;q=0, zstd", Gzip), Zstd);
+        assert_eq!(pick("gzip;q=0.0", Gzip), None);
+
+        // q parsing still accepts positive quality values.
+        assert_eq!(pick("gzip;q=0.5", None), Gzip);
+        assert_eq!(pick("gzip;q=1.0, deflate;q=0.5", None), Gzip);
+
+        // Nothing useful accepted.
+        assert_eq!(pick("deflate", Zstd), None);
+        assert_eq!(pick("gzip-foo", None), None); // prefix lookalike
+        assert_eq!(pick_response_encoding(&HeaderMap::new(), Gzip), None);
     }
 
     #[test]

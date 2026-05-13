@@ -48,7 +48,6 @@ See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/s
 ```
 GET /                              Status: dataset_id, tile_count, s3_source, s3_etag
 GET /tiles/{tilePath}              Tile by path (Valhalla-compatible)
-GET /tiles/{tilePath}.gz           Tile by path, gzip-compressed file
 GET /tiles_by_id/{tile_id}         Tile by numeric packed ID
 GET /health                        Health check
 ```
@@ -65,13 +64,22 @@ Examples:
 - Level 2, tile index 818660 → `2/000/818/660.gph`
 - Level 0, tile index 529 → `0/000/529.gph`
 
-## Gzip Support
+## Compression
 
-Tiles are compressed on the fly. Two modes cover different client expectations:
+Rati negotiates the response encoding via `Accept-Encoding`. Both **gzip** and **zstd**
+are supported on the wire; when both are accepted, rati prefers zstd (better ratio at
+similar speed).
 
-1. **Transparent compression** (`Accept-Encoding: gzip`) — Response includes `Content-Encoding: gzip`; compliant HTTP clients decompress automatically and see plain tile bytes. This is the mode Valhalla uses.
+Tiles inside the archive can themselves be compressed — `.gph`, `.gph.gz`, or
+`.gph.zst`. The on-disk compression is detected once at startup from the first tile's
+filename suffix (assumed uniform across the archive) and rati decompresses transparently
+when serving clients that asked for a different encoding. When the on-disk encoding
+matches what the client wants, rati passes the bytes straight through — no decode, no
+re-encode.
 
-2. **Raw gzip file** (`.gz` extension) — Requesting `/tiles/2/000/818/660.gph.gz` returns the gzip stream as-is, without `Content-Encoding`. The response body *is* a gzip file — useful for saving compressed tiles to disk.
+The HEAD path advertises `Content-Length` only when the response encoding matches what's
+on disk (the only case where the index size equals the body size we'd send); otherwise
+the header is omitted rather than fetching+decoding the tile just to measure it.
 
 ## CDN Headers
 
@@ -83,7 +91,7 @@ Every tile response includes headers suitable for CDN caching:
 | `Last-Modified` | S3 object last-modified timestamp |
 | `Cache-Control` | `public, max-age=<n>, immutable` — `<n>` from `--cache-max-age` (default 86400) |
 | `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or S3 ETag as fallback |
-| `Vary` | `Accept-Encoding` — ensures correct CDN behavior with gzip negotiation |
+| `Vary` | `Accept-Encoding` — ensures correct CDN behavior with encoding negotiation |
 | `Content-Type` | `application/octet-stream` |
 
 ## Dataset ID

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 description = "Lightweight S3-backed tile server for Valhalla graph and speed tiles"
 readme = "README.md"
-repository = "https://github.com/kinkard/rati"
+repository = "https://github.com/valhalla/rati"
 license = "MIT OR Apache-2.0"
 include = ["**/*.rs"]
 

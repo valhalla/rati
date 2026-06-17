@@ -1,6 +1,6 @@
 # Rati
 
-Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives stored on S3 via byte-range requests.
+Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3 or on the local filesystem — via byte-range reads.
 Named after the auger Odin used to bore through a mountain to reach the mead of poetry locked within.
 
 Rati was created with two use cases in mind:
@@ -15,7 +15,7 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — S3 location of the tar archive: `s3://bucket/path/to/tiles.tar`
+- `<archive>` — Archive location. Either an S3 URL (`s3://bucket/path/to/tiles.tar`) or a path to a local `.tar` file. Anything not starting with `s3://` is treated as a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -29,8 +29,11 @@ rati <archive> [OPTIONS]
 ### Example with Valhalla
 
 ```sh
-# Start Rati pointing at an S3 tile archive
+# Start Rati pointing at an S3 tile archive...
 rati s3://my-bucket/valhalla/tiles.tar --port 8080
+
+# ...or at a local tar file
+rati ./tiles.tar --port 8080
 
 # Generate a Valhalla config pointing at Rati
 ./valhalla_build_config \
@@ -46,7 +49,7 @@ See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/s
 ## Endpoints
 
 ```
-GET /                              Status: dataset_id, tile_count, s3_source, s3_etag
+GET /                              Status: dataset_id, tile_count, etag
 GET /tiles/{tilePath}              Tile by path (Valhalla-compatible)
 GET /tiles_by_id/{tile_id}         Tile by numeric packed ID
 GET /health                        Health check
@@ -87,10 +90,10 @@ Every tile response includes headers suitable for CDN caching:
 
 | Header | Description |
 |--------|-------------|
-| `ETag` | S3 object ETag, fetched at startup |
-| `Last-Modified` | S3 object last-modified timestamp |
+| `ETag` | S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives — both change whenever the archive is replaced |
+| `Last-Modified` | S3 object last-modified timestamp, or the file's mtime for local archives |
 | `Cache-Control` | `public, max-age=<n>, immutable` — `<n>` from `--cache-max-age` (default 86400) |
-| `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or S3 ETag as fallback |
+| `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or the ETag as fallback |
 | `Vary` | `Accept-Encoding` — ensures correct CDN behavior with encoding negotiation |
 | `Content-Type` | `application/octet-stream` |
 

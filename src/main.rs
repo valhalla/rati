@@ -23,7 +23,7 @@ use archive::TileCompression;
 
 #[derive(Parser)]
 struct Config {
-    /// S3 location of the archive: s3://bucket/key.tar
+    /// Archive location: `s3://bucket/key.tar` or a local filesystem path
     archive: String,
     /// Build index by scanning tar headers if index.bin is missing
     #[arg(long)]
@@ -44,7 +44,7 @@ struct Config {
 
 #[derive(Clone)]
 struct AppState {
-    archive: Arc<archive::S3Archive>,
+    archive: Arc<archive::Archive>,
     /// Pre-built status response (nothing changes at runtime).
     status: StatusResponse,
 }
@@ -68,13 +68,13 @@ fn main() {
 }
 
 async fn run(config: Config) {
-    let (archive, meta) = archive::S3Archive::open(
+    let (archive, meta) = archive::Archive::open(
         &config.archive,
         config.scan_index,
         config.dataset_id.as_deref(),
     )
     .await
-    .expect("failed to load tar index from S3");
+    .expect("failed to load tar index");
     info!(
         "Loaded {} with {} tiles (dataset_id={})",
         config.archive, meta.tile_count, meta.dataset_id,
@@ -253,7 +253,7 @@ async fn serve_tile(
         Ok(Some(b)) => b,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(tile_id = %tile_id, "S3 error: {e}");
+            tracing::error!(tile_id = %tile_id, "archive read error: {e}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };

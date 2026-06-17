@@ -1,10 +1,10 @@
-//! S3-backed tar archive: index parsing, tile lookups, and S3 I/O.
+//! Tar archive backed by S3 or the local filesystem: index parsing, tile lookups,
+//! and on-demand byte-range reads.
 //!
-//! Loads the tar index from an S3 object via range requests, then serves individual
-//! tiles by reading their byte ranges on demand. Startup performs a handful of small
-//! range reads against S3 — no full download:
+//! Loads the tar index via a handful of small range reads — no full download:
 //!
-//! 1. `HeadObject` for ETag, Last-Modified, and total size.
+//! 1. Source-specific metadata: S3 `HeadObject` (ETag, Last-Modified, size) or
+//!    filesystem `metadata()` (mtime, size; ETag synthesized from mtime+size).
 //! 2. First 512 bytes — the leading tar header, expected to name `index.bin`. If it
 //!    doesn't and `--scan-index` is set, fall back to [`scan_tar_headers`] which walks
 //!    the whole archive in 8 MB chunks with prefetch.
@@ -13,6 +13,8 @@
 //!    filename suffix ([`detect_compression`]).
 //! 5. A 272-byte read (or the full first tile when it's compressed) to extract the
 //!    dataset id from the `GraphTileHeader` ([`detect_dataset_id`]).
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
@@ -253,105 +255,76 @@ fn octal_to_u64(field: &[u8]) -> u64 {
 
 /// Metadata consumed once at startup: logging, tile headers, status endpoint.
 pub struct ArchiveMeta {
-    /// S3 object ETag (includes quotes, e.g. `"abc123"`).
+    /// Source ETag — S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives.
     pub etag: Box<str>,
-    /// S3 object Last-Modified as an HTTP-date string.
+    /// Source Last-Modified as an HTTP-date string.
     pub last_modified: Box<str>,
-    /// Dataset identifier: extracted from graph tile header, CLI override, or S3 ETag fallback.
+    /// Dataset identifier: extracted from graph tile header, CLI override, or ETag fallback.
     pub dataset_id: Box<str>,
     /// Number of tiles in the index.
     pub tile_count: usize,
 }
 
-pub struct S3Archive {
-    client: aws_sdk_s3::Client,
-    bucket: Box<str>,
-    key: Box<str>,
+pub struct Archive {
+    storage: Storage,
     index: TileIndex,
     compression: TileCompression,
 }
 
-impl S3Archive {
-    /// Connect to S3 and load the tar index.
+impl Archive {
+    /// Connect to the archive and load the tar index.
     ///
-    /// `url` must be in the form `s3://bucket/path/to/key`.
-    /// Uses the default AWS credential chain (SSO, IRSA, env vars, IMDS).
+    /// `source` is either an S3 URL (`s3://bucket/key`) or a local filesystem path.
+    /// For S3, uses the default AWS credential chain (SSO, IRSA, env vars, IMDS).
     ///
     /// If the first tar entry is not `index.bin` and `scan_index` is true, falls back
-    /// to scanning tar headers via range requests to build the index.
-    /// N.B.: That might be really slow for large archives as tar has no central directory.
+    /// to scanning tar headers to build the index — slow for large archives, since tar
+    /// has no central directory.
     ///
     /// `dataset_id_override` — if provided, used as the dataset ID instead of auto-detection.
     ///
     /// Returns the archive (for tile fetches) and metadata (consumed once at startup).
     pub async fn open(
-        url: &str,
+        source: &str,
         scan_index: bool,
         dataset_id_override: Option<&str>,
-    ) -> Result<(Self, ArchiveMeta), S3Error> {
-        let (bucket, key) = parse_s3_url(url)
-            .ok_or_else(|| S3Error::Protocol(format!("expected s3:// URL, got: {url}")))?;
-        let client = aws_sdk_s3::Client::new(
-            &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
-        );
-
-        // Fetch S3 object metadata (ETag, Last-Modified) via HeadObject
-        let head = client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| S3Error::Request(format!("HeadObject failed: {e}")))?;
-
-        let etag: Box<str> = head
-            .e_tag()
-            .ok_or_else(|| S3Error::Protocol("S3 HeadObject returned no ETag".into()))?
-            .into();
-
-        let last_modified: Box<str> = head
-            .last_modified()
-            .and_then(|dt| {
-                dt.fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
-                    .ok()
-            })
-            .ok_or_else(|| S3Error::Protocol("S3 HeadObject returned no Last-Modified".into()))?
-            .into();
-
-        let archive_size = head
-            .content_length()
-            .ok_or_else(|| S3Error::Protocol("S3 HeadObject returned no Content-Length".into()))?
-            as u64;
+    ) -> Result<(Self, ArchiveMeta), Error> {
+        let (storage, etag, last_modified, archive_size) =
+            if let Some((bucket, key)) = parse_s3_url(source) {
+                open_s3(bucket, key).await?
+            } else {
+                open_local(source)?
+            };
 
         // Step 1: Read the first 512-byte tar header
-        let header_bytes = get_range(&client, bucket, key, 0, 512).await?;
-        let header: &[u8; 512] = header_bytes
+        let header_bytes = storage.read_range(0, TAR_BLOCK_SIZE as u64).await?;
+        let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
             .as_ref()
             .try_into()
-            .map_err(|_| S3Error::Protocol("tar header shorter than 512 bytes".into()))?;
+            .map_err(|_| Error::Protocol("tar header shorter than 512 bytes".into()))?;
 
         // Step 2: Try to load index.bin; fall back to tar scan if missing and --scan-index is set.
         // The scan path sees filenames directly and detects compression inline; the index.bin
-        // path requires an extra 512-byte range request afterwards to read the first tile's
+        // path requires an extra 512-byte range read afterwards to read the first tile's
         // tar header.
         let (index, compression) = match read_index_header(header) {
             Ok((data_offset, data_size)) => {
-                let index_bytes = get_range(&client, bucket, key, data_offset, data_size).await?;
-                let index = parse_index(&index_bytes).map_err(S3Error::Tar)?;
-                let compression = detect_compression(&client, bucket, key, &index).await?;
+                let index_bytes = storage.read_range(data_offset, data_size).await?;
+                let index = parse_index(&index_bytes).map_err(Error::Tar)?;
+                let compression = detect_compression(&storage, &index).await?;
                 (index, compression)
             }
             Err(TarError::FirstEntryNotIndex { .. }) if scan_index => {
                 tracing::warn!(
                     "index.bin not found in archive; scanning tar headers to build index \
-                     via range requests."
+                     via range reads."
                 );
-                scan_tar_headers(&client, bucket, key, archive_size).await?
+                scan_tar_headers(&storage, archive_size).await?
             }
             Err(TarError::FirstEntryNotIndex { .. }) => {
-                return Err(S3Error::Tar(TarError::MissingIndexNoScan));
+                return Err(Error::Tar(TarError::MissingIndexNoScan));
             }
-            Err(e) => return Err(S3Error::Tar(e)),
+            Err(e) => return Err(Error::Tar(e)),
         };
 
         tracing::info!("Tile compression: {compression}");
@@ -362,16 +335,16 @@ impl S3Archive {
             override_id.into()
         } else {
             // Try to auto-detect from the first tile's GraphTileHeader
-            match detect_dataset_id(&client, bucket, key, &index, compression).await {
+            match detect_dataset_id(&storage, &index, compression).await {
                 Ok(id) => {
                     tracing::info!("Auto-detected dataset ID from graph tile header: {id}");
                     id.to_string().into()
                 }
                 Err(e) => {
-                    // Fall back to S3 ETag
+                    // Fall back to ETag
                     tracing::warn!(
                         "Could not detect dataset ID from tile header ({e}); \
-                         falling back to S3 ETag: {etag}"
+                         falling back to ETag: {etag}"
                     );
                     etag.clone()
                 }
@@ -381,9 +354,7 @@ impl S3Archive {
         let tile_count = index.len();
 
         let archive = Self {
-            client,
-            bucket: bucket.into(),
-            key: key.into(),
+            storage,
             index,
             compression,
         };
@@ -401,18 +372,14 @@ impl S3Archive {
     /// Fetch a tile's on-disk bytes — exactly what's stored in the tar, compressed or not.
     /// Callers inspect [`compression`](Self::compression) to decide whether to decode.
     /// Returns `None` if the tile is not in the index.
-    pub async fn get_tile(&self, tile_id: TileId) -> Result<Option<Bytes>, S3Error> {
+    pub async fn get_tile(&self, tile_id: TileId) -> Result<Option<Bytes>, Error> {
         let Some(entry) = self.index.get(&tile_id) else {
             return Ok(None);
         };
-        let raw = get_range(
-            &self.client,
-            &self.bucket,
-            &self.key,
-            entry.offset,
-            entry.size as u64,
-        )
-        .await?;
+        let raw = self
+            .storage
+            .read_range(entry.offset, entry.size as u64)
+            .await?;
         Ok(Some(raw))
     }
 
@@ -426,6 +393,167 @@ impl S3Archive {
     pub fn compression(&self) -> TileCompression {
         self.compression
     }
+}
+
+/// Storage backend for a tar archive. Hides whether bytes come from S3 or a local file —
+/// every read goes through [`Storage::read_range`]; everything above this layer is unaware
+/// of the source.
+enum Storage {
+    S3 {
+        client: aws_sdk_s3::Client,
+        bucket: Box<str>,
+        key: Box<str>,
+    },
+    Local {
+        // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
+        // from multiple `spawn_blocking` tasks without `try_clone()` syscalls per read.
+        file: Arc<std::fs::File>,
+    },
+}
+
+impl Storage {
+    /// Read `length` bytes at `offset`. The only place where the two backends diverge.
+    async fn read_range(&self, offset: u64, length: u64) -> Result<Bytes, Error> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        match self {
+            Self::S3 {
+                client,
+                bucket,
+                key,
+            } => read_s3_range(client, bucket, key, offset, length).await,
+            Self::Local { file } => read_local_range(file.clone(), offset, length).await,
+        }
+    }
+}
+
+/// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
+/// pieces `Archive::open` needs to read the rest.
+async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
+    let client = aws_sdk_s3::Client::new(
+        &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+    );
+
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| Error::Io(format!("HeadObject failed: {e}")))?;
+
+    let etag: Box<str> = head
+        .e_tag()
+        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no ETag".into()))?
+        .into();
+
+    let last_modified: Box<str> = head
+        .last_modified()
+        .and_then(|dt| {
+            dt.fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
+                .ok()
+        })
+        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no Last-Modified".into()))?
+        .into();
+
+    let archive_size = head
+        .content_length()
+        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no Content-Length".into()))?
+        as u64;
+
+    Ok((
+        Storage::S3 {
+            client,
+            bucket: bucket.into(),
+            key: key.into(),
+        },
+        etag,
+        last_modified,
+        archive_size,
+    ))
+}
+
+async fn read_s3_range(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Bytes, Error> {
+    let range = format!("bytes={}-{}", offset, offset + length - 1);
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(&range)
+        .send()
+        .await
+        .map_err(|e| Error::Io(format!("S3 GetObject failed: {e}")))?;
+    let data = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::Io(format!("reading S3 response body: {e}")))?
+        .into_bytes();
+    Ok(data)
+}
+
+/// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
+/// (matches a fresh value whenever the archive changes); Last-Modified is the file's
+/// mtime formatted as an HTTP-date.
+fn open_local(path: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| Error::Io(format!("stat({path}) failed: {e}")))?;
+    if !metadata.is_file() {
+        return Err(Error::Protocol(format!("{path} is not a regular file")));
+    }
+    let archive_size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .map_err(|e| Error::Io(format!("{path} has no mtime: {e}")))?;
+    let mtime_unix = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Protocol("file mtime is before UNIX epoch".into()))?
+        .as_secs();
+    let etag: Box<str> = format!("\"{mtime_unix}-{archive_size}\"").into();
+    let last_modified: Box<str> = aws_sdk_s3::primitives::DateTime::from(mtime)
+        .fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
+        .map_err(|e| Error::Protocol(format!("format mtime as HttpDate: {e}")))?
+        .into();
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Io(format!("open({path}) failed: {e}")))?;
+
+    Ok((
+        Storage::Local {
+            file: Arc::new(file),
+        },
+        etag,
+        last_modified,
+        archive_size,
+    ))
+}
+
+async fn read_local_range(
+    file: Arc<std::fs::File>,
+    offset: u64,
+    length: u64,
+) -> Result<Bytes, Error> {
+    let len = length as usize;
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; len];
+        file.read_exact_at(&mut buf, offset)
+            .map(|()| Bytes::from(buf))
+    })
+    .await
+    .map_err(|e| Error::Io(format!("local read task panicked: {e}")))?
+    .map_err(|e| {
+        Error::Io(format!(
+            "local read_at(offset={offset}, len={length}) failed: {e}"
+        ))
+    })
 }
 
 /// Decompress `data` according to `compression`. Returns the input unchanged for `TileCompression::None`.
@@ -448,52 +576,20 @@ pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<
     }
 }
 
-async fn get_range(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    offset: u64,
-    length: u64,
-) -> Result<Bytes, S3Error> {
-    if length == 0 {
-        return Ok(Bytes::new());
-    }
-    let range = format!("bytes={}-{}", offset, offset + length - 1);
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .range(&range)
-        .send()
-        .await
-        .map_err(|e| S3Error::Request(format!("{e}")))?;
-
-    let data = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| S3Error::Request(format!("reading response body: {e}")))?
-        .into_bytes();
-
-    Ok(data)
-}
-
-/// Scan tar headers via S3 range requests to build the tile index.
+/// Scan tar headers via the storage backend to build the tile index.
 ///
 /// Reads the archive in fixed-offset 8 MB chunks, parsing only the 512-byte tar
 /// headers and skipping over tile data. Up to `PREFETCH` chunks are in-flight
 /// concurrently (via [`futures_util::StreamExt::buffered`]), so the next chunk is
 /// typically ready by the time the scanner finishes the current one.
 async fn scan_tar_headers(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
+    storage: &Storage,
     archive_size: u64,
-) -> Result<(TileIndex, TileCompression), S3Error> {
+) -> Result<(TileIndex, TileCompression), Error> {
     use futures_util::{StreamExt, stream};
 
     // Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
-    // ~10k chunk requests (with prefetch) is much faster than 205k sequential header reads.
+    // ~10k chunk reads (with prefetch) is much faster than 205k sequential header reads.
     const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
     const PREFETCH: usize = 8;
 
@@ -502,7 +598,7 @@ async fn scan_tar_headers(
         .map(|i| {
             let offset = i * CHUNK_SIZE;
             let len = CHUNK_SIZE.min(archive_size - offset);
-            get_range(client, bucket, key, offset, len)
+            storage.read_range(offset, len)
         })
         .buffered(PREFETCH);
 
@@ -522,7 +618,7 @@ async fn scan_tar_headers(
             chunk = chunks
                 .next()
                 .await
-                .ok_or_else(|| S3Error::Protocol("unexpected end of chunk stream".into()))??;
+                .ok_or_else(|| Error::Protocol("unexpected end of chunk stream".into()))??;
             chunk_start = next_chunk_idx * CHUNK_SIZE;
             next_chunk_idx += 1;
         }
@@ -541,7 +637,7 @@ async fn scan_tar_headers(
                 chunk = chunks
                     .next()
                     .await
-                    .ok_or_else(|| S3Error::Protocol("unexpected end of chunk stream".into()))??;
+                    .ok_or_else(|| Error::Protocol("unexpected end of chunk stream".into()))??;
                 chunk_start = next_chunk_idx * CHUNK_SIZE;
                 next_chunk_idx += 1;
                 buf[chunk_remaining..].copy_from_slice(&chunk[..TAR_BLOCK_SIZE - chunk_remaining]);
@@ -555,7 +651,7 @@ async fn scan_tar_headers(
             break;
         }
 
-        let header = TarHeader::parse(header_array).map_err(S3Error::Tar)?;
+        let header = TarHeader::parse(header_array).map_err(Error::Tar)?;
 
         let data_offset = pos + TAR_BLOCK_SIZE as u64;
         let data_size = header.size;
@@ -589,7 +685,7 @@ async fn scan_tar_headers(
     }
 
     if entries.is_empty() {
-        return Err(S3Error::Tar(TarError::EmptyIndex));
+        return Err(Error::Tar(TarError::EmptyIndex));
     }
     entries.shrink_to_fit();
 
@@ -599,30 +695,23 @@ async fn scan_tar_headers(
 
 /// Read the tar header of the first tile listed in `index` and detect compression from its name.
 ///
-/// Index entries store only `tile_id`, not filenames, so we need one additional 512-byte range
-/// request to recover the name. The tar header sits 512 bytes before the tile data.
+/// Index entries store only `tile_id`, not filenames, so we need one additional 512-byte read
+/// to recover the name. The tar header sits 512 bytes before the tile data.
 async fn detect_compression(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
+    storage: &Storage,
     index: &TileIndex,
-) -> Result<TileCompression, S3Error> {
+) -> Result<TileCompression, Error> {
     let Some(entry) = index.values().next() else {
         return Ok(TileCompression::None); // no tiles - no compression
     };
-    let header_bytes = get_range(
-        client,
-        bucket,
-        key,
-        entry.offset - TAR_BLOCK_SIZE as u64,
-        TAR_BLOCK_SIZE as u64,
-    )
-    .await?;
+    let header_bytes = storage
+        .read_range(entry.offset - TAR_BLOCK_SIZE as u64, TAR_BLOCK_SIZE as u64)
+        .await?;
     let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
         .as_ref()
         .try_into()
-        .map_err(|_| S3Error::Protocol("tile header shorter than 512 bytes".into()))?;
-    let parsed = TarHeader::parse(header).map_err(S3Error::Tar)?;
+        .map_err(|_| Error::Protocol("tile header shorter than 512 bytes".into()))?;
+    let parsed = TarHeader::parse(header).map_err(Error::Tar)?;
     Ok(TileCompression::from_name(&parsed.name))
 }
 
@@ -635,16 +724,14 @@ async fn detect_compression(
 /// Returns an error if no tiles are in the index, the tile is too small, or
 /// the `dataset_id` field is zero (likely not a graph tile).
 async fn detect_dataset_id(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
+    storage: &Storage,
     index: &TileIndex,
     compression: TileCompression,
-) -> Result<u64, S3Error> {
+) -> Result<u64, Error> {
     let entry = index
         .values()
         .next()
-        .ok_or_else(|| S3Error::Protocol("no tiles in index to read header from".into()))?;
+        .ok_or_else(|| Error::Protocol("no tiles in index to read header from".into()))?;
 
     // For plain tiles we only need the first 272 bytes; for compressed tiles we have
     // to fetch and decompress the whole thing to read any prefix of the plain data.
@@ -652,23 +739,23 @@ async fn detect_dataset_id(
         TileCompression::None => {
             let read_size = GRAPH_TILE_HEADER_SIZE as u64;
             if (entry.size as u64) < read_size {
-                return Err(S3Error::Protocol(format!(
+                return Err(Error::Protocol(format!(
                     "tile is only {} bytes, too small for GraphTileHeader ({} bytes)",
                     entry.size, GRAPH_TILE_HEADER_SIZE
                 )));
             }
-            get_range(client, bucket, key, entry.offset, read_size).await?
+            storage.read_range(entry.offset, read_size).await?
         }
         _ => {
-            let raw = get_range(client, bucket, key, entry.offset, entry.size as u64).await?;
+            let raw = storage.read_range(entry.offset, entry.size as u64).await?;
             decompress(raw, compression)
-                .map_err(|e| S3Error::Protocol(format!("decode tile for dataset_id: {e}")))?
+                .map_err(|e| Error::Protocol(format!("decode tile for dataset_id: {e}")))?
         }
     };
     let dataset_id = parse_dataset_id(&data)?;
 
     if dataset_id == 0 {
-        return Err(S3Error::Protocol(
+        return Err(Error::Protocol(
             "dataset_id is 0; tile may not be a graph tile".into(),
         ));
     }
@@ -680,9 +767,9 @@ async fn detect_dataset_id(
 ///
 /// The `dataset_id_` field is a little-endian `u64` at byte offset 32 within the
 /// 272-byte header.
-fn parse_dataset_id(header: &[u8]) -> Result<u64, S3Error> {
+fn parse_dataset_id(header: &[u8]) -> Result<u64, Error> {
     if header.len() < DATASET_ID_OFFSET + 8 {
-        return Err(S3Error::Protocol(format!(
+        return Err(Error::Protocol(format!(
             "header too short for dataset_id: {} bytes (need at least {})",
             header.len(),
             DATASET_ID_OFFSET + 8
@@ -718,9 +805,9 @@ pub enum TarError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum S3Error {
-    #[error("S3 request failed: {0}")]
-    Request(String),
+pub enum Error {
+    #[error("I/O error: {0}")]
+    Io(String),
 
     #[error("{0}")]
     Protocol(String),

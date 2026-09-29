@@ -130,7 +130,6 @@ impl Storage {
     }
 }
 
-/// Filesystem-backed tar archive: `stat` for metadata, positional reads for ranges.
 /// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
 /// (matches a fresh value whenever the archive changes); Last-Modified is the file's
 /// mtime formatted as an HTTP-date.
@@ -190,11 +189,8 @@ async fn read_local_range(
     })
 }
 
-/// S3-backed tar archive: `HeadObject` for metadata, ranged `GetObject` for reads.
-#[cfg(feature = "s3")]
 #[cfg(feature = "s3")]
 /// Split an `s3://bucket/key` URL into its bucket and key.
-#[cfg(feature = "s3")]
 fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
     let path = url.strip_prefix("s3://")?;
     path.split_once('/')
@@ -203,7 +199,6 @@ fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
 #[cfg(feature = "s3")]
 /// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
 /// pieces `Archive::open` needs to read the rest.
-#[cfg(feature = "s3")]
 async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Error> {
     let client = aws_sdk_s3::Client::new(
         &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,

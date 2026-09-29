@@ -67,8 +67,6 @@ first row that matches wins:
 | `AZURE_CLIENT_ID` | user-assigned managed identity |
 | otherwise | system-assigned managed identity |
 
-Whichever identity is used needs **Storage Blob Data Reader** on the account or container.
-
 Three rati-specific notes:
 
 - A bearer token is only ever sent to an `https` Azure Blob host. An archive behind a CDN,

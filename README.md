@@ -1,6 +1,6 @@
 # Rati
 
-Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3 or on the local filesystem — via byte-range reads.
+Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3, Azure Blob Storage, or on the local filesystem — via byte-range reads.
 Named after the auger Odin used to bore through a mountain to reach the mead of poetry locked within.
 
 Rati was created with two use cases in mind:
@@ -15,7 +15,9 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — Archive location. Either an S3 URL (`s3://bucket/path/to/tiles.tar`) or a path to a local `.tar` file. Anything not starting with `s3://` is treated as a local path.
+- `<archive>` — Archive location. An S3 URL (`s3://bucket/path/to/tiles.tar`), an Azure Blob
+  URL (`https://<account>.blob.core.windows.net/<container>/tiles.tar`), or a path to a local
+  `.tar` file. Anything else is treated as a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -45,6 +47,50 @@ rati ./tiles.tar --port 8080
 ```
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
+
+### Azure Blob Storage
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
+```
+
+There are no Azure flags. The identity is chosen from the environment, using the same
+variables every Azure SDK reads, in the order `DefaultAzureCredential` uses elsewhere — the
+first row that matches wins:
+
+| Condition | Identity |
+|-----------|----------|
+| URL is `http://`, or carries a SAS (`?...&sig=...`) | none — anonymous |
+| Host is not an Azure Blob endpoint | none — anonymous |
+| `AZURE_FEDERATED_TOKEN_FILE` | workload identity (AKS) |
+| `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` | service principal |
+| `AZURE_CLIENT_ID` | user-assigned managed identity |
+| otherwise | system-assigned managed identity |
+
+Three rati-specific notes:
+
+- A bearer token is only ever sent to an `https` Azure Blob host. An archive behind a CDN,
+  Front Door, or a storage-account custom domain is reached anonymously, so it must be
+  public or the URL must carry a SAS.
+- Plaintext (`http://`) endpoints are always anonymous — rati will not put a bearer token on
+  the wire in the clear. Azurite therefore needs no configuration at all; point rati at
+  `http://127.0.0.1:10000/devstoreaccount1/valhalla/tiles.tar`. For local development against
+  real blob storage, use a service principal or a SAS.
+- Do not set `Content-Encoding` on the archive blob. A blob-level encoding confuses CDNs and
+  proxies in front of rati.
+
+## Build Features
+
+| Feature | Default | Pulls in |
+|---------|---------|----------|
+| `s3` | yes | `aws-config`, `aws-sdk-s3` |
+| `azure` | yes | `azure_storage_blob`, `azure_identity` |
+
+Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
+
+```sh
+cargo build --release --no-default-features --features azure
+```
 
 ## Endpoints
 
@@ -90,8 +136,8 @@ Every tile response includes headers suitable for CDN caching:
 
 | Header | Description |
 |--------|-------------|
-| `ETag` | S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives — both change whenever the archive is replaced |
-| `Last-Modified` | S3 object last-modified timestamp, or the file's mtime for local archives |
+| `ETag` | The object or blob ETag, or synthesized `"<mtime>-<size>"` for local archives — all change whenever the archive is replaced |
+| `Last-Modified` | The object or blob last-modified timestamp, or the file's mtime for local archives |
 | `Cache-Control` | `public, max-age=<n>, immutable` — `<n>` from `--cache-max-age` (default 86400) |
 | `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or the ETag as fallback |
 | `Vary` | `Accept-Encoding` — ensures correct CDN behavior with encoding negotiation |
@@ -101,7 +147,7 @@ Every tile response includes headers suitable for CDN caching:
 
 For graph tile archives (`.gph`), the dataset ID is automatically extracted from the `GraphTileHeader` of the first tile in the archive. This is typically the OSM changeset ID (`dataset_id_` field, a `u64` at byte offset 32 in the 272-byte header).
 
-For any other kind of archive, use `--dataset-id` to provide an explicit value. If neither works, the S3 ETag is used as a fallback.
+For any other kind of archive, use `--dataset-id` to provide an explicit value. If neither works, the archive ETag is used as a fallback.
 
 ## Index Modes
 

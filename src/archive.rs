@@ -1,10 +1,8 @@
-//! Tar archive backed by S3 or the local filesystem: index parsing, tile lookups,
-//! and on-demand byte-range reads.
+//! Tar archive index parsing and tile lookups, reading bytes through a [`Storage`] backend.
 //!
 //! Loads the tar index via a handful of small range reads — no full download:
 //!
-//! 1. Source-specific metadata: S3 `HeadObject` (ETag, Last-Modified, size) or
-//!    filesystem `metadata()` (mtime, size; ETag synthesized from mtime+size).
+//! 1. Source metadata from the backend — see [`crate::storage`].
 //! 2. First 512 bytes — the leading tar header, expected to name `index.bin`. If it
 //!    doesn't and `--scan-index` is set, fall back to [`scan_tar_headers`] which walks
 //!    the whole archive in 8 MB chunks with prefetch.
@@ -14,10 +12,10 @@
 //! 5. A 272-byte read (or the full first tile when it's compressed) to extract the
 //!    dataset id from the `GraphTileHeader` ([`detect_dataset_id`]).
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
+
+use crate::storage::{ArchiveSource, Storage};
 
 /// Size of a POSIX tar header block.
 const TAR_BLOCK_SIZE: usize = 512;
@@ -274,8 +272,8 @@ pub struct Archive {
 impl Archive {
     /// Connect to the archive and load the tar index.
     ///
-    /// `source` is either an S3 URL (`s3://bucket/key`) or a local filesystem path.
-    /// For S3, uses the default AWS credential chain (SSO, IRSA, env vars, IMDS).
+    /// `source` is an S3 URL (`s3://bucket/key`), an Azure Blob HTTPS URL, or a local
+    /// filesystem path — see [`crate::storage`] for how each is opened and authenticated.
     ///
     /// If the first tar entry is not `index.bin` and `scan_index` is true, falls back
     /// to scanning tar headers to build the index — slow for large archives, since tar
@@ -289,15 +287,20 @@ impl Archive {
         scan_index: bool,
         dataset_id_override: Option<&str>,
     ) -> Result<(Self, ArchiveMeta), Error> {
-        let (storage, etag, last_modified, archive_size) =
-            if let Some((bucket, key)) = parse_s3_url(source) {
-                open_s3(bucket, key).await?
-            } else {
-                open_local(source)?
-            };
+        let (storage, src) = Storage::open(source).await?;
+        let ArchiveSource {
+            etag,
+            last_modified,
+            size: archive_size,
+            prefetch,
+        } = src;
 
-        // Step 1: Read the first 512-byte tar header
-        let header_bytes = storage.read_range(0, TAR_BLOCK_SIZE as u64).await?;
+        // Step 1: the first 512-byte tar header, reusing it if the backend already
+        // read it while fetching metadata.
+        let header_bytes = match prefetch {
+            Some(bytes) if bytes.len() >= TAR_BLOCK_SIZE => bytes.slice(0..TAR_BLOCK_SIZE),
+            _ => storage.read_range(0, TAR_BLOCK_SIZE as u64).await?,
+        };
         let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
             .as_ref()
             .try_into()
@@ -393,167 +396,6 @@ impl Archive {
     pub fn compression(&self) -> TileCompression {
         self.compression
     }
-}
-
-/// Storage backend for a tar archive. Hides whether bytes come from S3 or a local file —
-/// every read goes through [`Storage::read_range`]; everything above this layer is unaware
-/// of the source.
-enum Storage {
-    S3 {
-        client: aws_sdk_s3::Client,
-        bucket: Box<str>,
-        key: Box<str>,
-    },
-    Local {
-        // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
-        // from multiple `spawn_blocking` tasks without `try_clone()` syscalls per read.
-        file: Arc<std::fs::File>,
-    },
-}
-
-impl Storage {
-    /// Read `length` bytes at `offset`. The only place where the two backends diverge.
-    async fn read_range(&self, offset: u64, length: u64) -> Result<Bytes, Error> {
-        if length == 0 {
-            return Ok(Bytes::new());
-        }
-
-        match self {
-            Self::S3 {
-                client,
-                bucket,
-                key,
-            } => read_s3_range(client, bucket, key, offset, length).await,
-            Self::Local { file } => read_local_range(file.clone(), offset, length).await,
-        }
-    }
-}
-
-/// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
-/// pieces `Archive::open` needs to read the rest.
-async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
-    let client = aws_sdk_s3::Client::new(
-        &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
-    );
-
-    let head = client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| Error::Io(format!("HeadObject failed: {e}")))?;
-
-    let etag: Box<str> = head
-        .e_tag()
-        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no ETag".into()))?
-        .into();
-
-    let last_modified: Box<str> = head
-        .last_modified()
-        .and_then(|dt| {
-            dt.fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
-                .ok()
-        })
-        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no Last-Modified".into()))?
-        .into();
-
-    let archive_size = head
-        .content_length()
-        .ok_or_else(|| Error::Protocol("S3 HeadObject returned no Content-Length".into()))?
-        as u64;
-
-    Ok((
-        Storage::S3 {
-            client,
-            bucket: bucket.into(),
-            key: key.into(),
-        },
-        etag,
-        last_modified,
-        archive_size,
-    ))
-}
-
-async fn read_s3_range(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    offset: u64,
-    length: u64,
-) -> Result<Bytes, Error> {
-    let range = format!("bytes={}-{}", offset, offset + length - 1);
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .range(&range)
-        .send()
-        .await
-        .map_err(|e| Error::Io(format!("S3 GetObject failed: {e}")))?;
-    let data = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| Error::Io(format!("reading S3 response body: {e}")))?
-        .into_bytes();
-    Ok(data)
-}
-
-/// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
-/// (matches a fresh value whenever the archive changes); Last-Modified is the file's
-/// mtime formatted as an HTTP-date.
-fn open_local(path: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| Error::Io(format!("stat({path}) failed: {e}")))?;
-    if !metadata.is_file() {
-        return Err(Error::Protocol(format!("{path} is not a regular file")));
-    }
-    let archive_size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .map_err(|e| Error::Io(format!("{path} has no mtime: {e}")))?;
-    let mtime_unix = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| Error::Protocol("file mtime is before UNIX epoch".into()))?
-        .as_secs();
-    let etag: Box<str> = format!("\"{mtime_unix}-{archive_size}\"").into();
-    let last_modified: Box<str> = aws_sdk_s3::primitives::DateTime::from(mtime)
-        .fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
-        .map_err(|e| Error::Protocol(format!("format mtime as HttpDate: {e}")))?
-        .into();
-    let file =
-        std::fs::File::open(path).map_err(|e| Error::Io(format!("open({path}) failed: {e}")))?;
-
-    Ok((
-        Storage::Local {
-            file: Arc::new(file),
-        },
-        etag,
-        last_modified,
-        archive_size,
-    ))
-}
-
-async fn read_local_range(
-    file: Arc<std::fs::File>,
-    offset: u64,
-    length: u64,
-) -> Result<Bytes, Error> {
-    let len = length as usize;
-    tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; len];
-        file.read_exact_at(&mut buf, offset)
-            .map(|()| Bytes::from(buf))
-    })
-    .await
-    .map_err(|e| Error::Io(format!("local read task panicked: {e}")))?
-    .map_err(|e| {
-        Error::Io(format!(
-            "local read_at(offset={offset}, len={length}) failed: {e}"
-        ))
-    })
 }
 
 /// Decompress `data` according to `compression`. Returns the input unchanged for `TileCompression::None`.
@@ -779,11 +621,6 @@ fn parse_dataset_id(header: &[u8]) -> Result<u64, Error> {
         .try_into()
         .unwrap();
     Ok(u64::from_le_bytes(bytes))
-}
-
-fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
-    let path = url.strip_prefix("s3://")?;
-    path.split_once('/')
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1041,23 +878,5 @@ mod tests {
 
         let result = parse_dataset_id(&header).unwrap();
         assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn parse_s3_url_test() {
-        assert_eq!(
-            parse_s3_url("s3://my-bucket/path/to/file.tar"),
-            Some(("my-bucket", "path/to/file.tar"))
-        );
-        assert_eq!(
-            parse_s3_url("s3://bucket/file.tar"),
-            Some(("bucket", "file.tar"))
-        );
-
-        assert_eq!(parse_s3_url("bucket/key"), None);
-        assert_eq!(parse_s3_url("https://wrong/scheme"), None);
-        assert_eq!(parse_s3_url("s3:/bad-url/format"), None);
-        assert_eq!(parse_s3_url("s3://bucket-only"), None);
-        assert_eq!(parse_s3_url("s3://file-only.tar"), None);
     }
 }

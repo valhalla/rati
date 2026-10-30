@@ -358,8 +358,10 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip finish on Vec cannot fail")
 }
 
+/// One-shot `bulk` compression records the content size in the frame header,
+/// so clients can size their output buffer up front.
 fn zstd_compress(data: &[u8]) -> Vec<u8> {
-    zstd::encode_all(data, 0).expect("zstd encode to Vec cannot fail")
+    zstd::bulk::compress(data, 0).expect("zstd compress to Vec cannot fail")
 }
 
 /// Derived once at startup; the `set_cache_headers` middleware merges these into every tile response.

@@ -573,12 +573,8 @@ pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<
             decoder.read_to_end(&mut out)?;
             Ok(Bytes::from(out))
         }
-        TileCompression::Zstd => {
-            let mut decoder = zstd::stream::Decoder::new(data.as_ref())?;
-            let mut out = Vec::with_capacity(data.len() * 4);
-            decoder.read_to_end(&mut out)?;
-            Ok(Bytes::from(out))
-        }
+        // Sizes the output from the frame header (capped by zstd), when the frame records it
+        TileCompression::Zstd => Ok(Bytes::from(zstd::decode_all(data.as_ref())?)),
     }
 }
 
@@ -825,6 +821,7 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// Build a minimal tar header for a file with the given name and size.
     fn make_tar_header(name: &str, size: u64) -> [u8; TAR_BLOCK_SIZE] {
@@ -919,7 +916,7 @@ mod tests {
     fn reject_non_index_first_entry() {
         let header = make_tar_header("0/000/529.gph", 1024);
         let err = read_index_header(&header).unwrap_err();
-        assert!(matches!(err, TarError::FirstEntryNotIndex { .. }));
+        assert_matches!(err, TarError::FirstEntryNotIndex { .. });
     }
 
     #[test]
@@ -975,23 +972,28 @@ mod tests {
         let out = decompress(Bytes::from(gz), TileCompression::Gzip).unwrap();
         assert_eq!(out.as_ref(), plain.as_slice());
 
-        // Zstd
-        let zst = zstd::encode_all(plain.as_slice(), 3).unwrap();
-        let out = decompress(Bytes::from(zst), TileCompression::Zstd).unwrap();
-        assert_eq!(out.as_ref(), plain.as_slice());
+        // Zstd: streamed frame without the content size, and bulk frame with it
+        let streamed = zstd::encode_all(plain.as_slice(), 3).unwrap();
+        let bulk = zstd::bulk::compress(&plain, 3).unwrap();
+        assert_eq!(zstd::decompressed_size(&streamed), None);
+        assert_eq!(zstd::decompressed_size(&bulk), Some(plain.len() as u64));
+        for zst in [streamed, bulk] {
+            let out = decompress(Bytes::from(zst), TileCompression::Zstd).unwrap();
+            assert_eq!(out.as_ref(), plain.as_slice());
+        }
     }
 
     #[test]
     fn reject_invalid_index_size() {
         let data = vec![0u8; 17]; // not a multiple of 16
         let err = parse_index(&data).unwrap_err();
-        assert!(matches!(err, TarError::InvalidIndexSize { .. }));
+        assert_matches!(err, TarError::InvalidIndexSize { .. });
     }
 
     #[test]
     fn reject_empty_index() {
         let err = parse_index(&[]).unwrap_err();
-        assert!(matches!(err, TarError::EmptyIndex));
+        assert_matches!(err, TarError::EmptyIndex);
     }
 
     #[test]

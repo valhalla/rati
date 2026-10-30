@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
@@ -432,9 +433,14 @@ impl Storage {
 /// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
 /// pieces `Archive::open` needs to read the rest.
 async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
-    let client = aws_sdk_s3::Client::new(
-        &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
-    );
+    let http = aws_smithy_http_client::Builder::new()
+        .tls_provider(Provider::Rustls(CryptoMode::Ring))
+        .build_https();
+    let aws = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .http_client(http)
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&aws);
 
     let head = client
         .head_object()

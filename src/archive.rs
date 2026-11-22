@@ -265,7 +265,7 @@ impl Archive {
                 "index.bin not found in archive; scanning tar headers to build index \
                  via range reads."
             );
-            scan_tar_headers(&storage).await?
+            scan_tar_headers(&storage, SCAN_CHUNK_SIZE).await?
         } else {
             return Err(Error::Protocol(format!(
                 "first tar entry is '{}', not 'index.bin'; re-run with --scan-index to build \
@@ -350,22 +350,26 @@ pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<
     }
 }
 
-/// Reads the archive in 8 MB chunks with up to `PREFETCH` in flight, parsing only tar headers.
-async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompression), Error> {
+// Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
+// ~10k chunk reads (with prefetch) is much faster than 205k sequential header reads.
+const SCAN_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Reads the archive in `chunk_size` chunks with up to `PREFETCH` in flight, parsing only tar
+/// headers. `chunk_size` must be at least one tar block.
+async fn scan_tar_headers(
+    storage: &Storage,
+    chunk_size: u64,
+) -> Result<(TileIndex, TileCompression), Error> {
     use futures_util::{StreamExt, stream};
 
+    const PREFETCH: usize = 8;
     let archive_size = storage.size;
 
-    // Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
-    // ~10k chunk reads (with prefetch) is much faster than 205k sequential header reads.
-    const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
-    const PREFETCH: usize = 8;
-
-    let num_chunks = archive_size.div_ceil(CHUNK_SIZE);
+    let num_chunks = archive_size.div_ceil(chunk_size);
     let mut chunks = stream::iter(0..num_chunks)
         .map(|i| {
-            let offset = i * CHUNK_SIZE;
-            let len = CHUNK_SIZE.min(archive_size - offset);
+            let offset = i * chunk_size;
+            let len = chunk_size.min(archive_size - offset);
             storage.read_range(offset, len)
         })
         .buffered(PREFETCH);
@@ -380,13 +384,13 @@ async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompressi
 
     while pos + TAR_BLOCK_SIZE as u64 <= archive_size {
         // Advance stream to the chunk containing `pos`, discarding any skipped chunks
-        let needed_chunk = pos / CHUNK_SIZE;
+        let needed_chunk = pos / chunk_size;
         while next_chunk_idx <= needed_chunk {
             chunk = chunks
                 .next()
                 .await
                 .ok_or_else(|| Error::Protocol("unexpected end of chunk stream".into()))??;
-            chunk_start = next_chunk_idx * CHUNK_SIZE;
+            chunk_start = next_chunk_idx * chunk_size;
             next_chunk_idx += 1;
         }
 
@@ -405,7 +409,7 @@ async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompressi
                     .next()
                     .await
                     .ok_or_else(|| Error::Protocol("unexpected end of chunk stream".into()))??;
-                chunk_start = next_chunk_idx * CHUNK_SIZE;
+                chunk_start = next_chunk_idx * chunk_size;
                 next_chunk_idx += 1;
                 buf[chunk_remaining..].copy_from_slice(&chunk[..TAR_BLOCK_SIZE - chunk_remaining]);
                 buf
@@ -550,8 +554,8 @@ mod tests {
         let size_str = format!("{:011o}\0", size);
         header[124..136].copy_from_slice(size_str.as_bytes());
 
-        // typeflag = '0' (regular file) at byte 156
-        header[156] = b'0';
+        // typeflag at byte 156: '5' for directories, '0' for regular files
+        header[156] = if name.ends_with('/') { b'5' } else { b'0' };
 
         // magic = "ustar\0" at bytes 257-262
         header[257..263].copy_from_slice(b"ustar\0");
@@ -582,6 +586,119 @@ mod tests {
             data.extend_from_slice(&size.to_le_bytes());
         }
         data
+    }
+
+    /// Returns the tar bytes and the data offset of each entry.
+    fn make_tar(entries: &[(&str, Vec<u8>)]) -> (Vec<u8>, Vec<u64>) {
+        let mut tar = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, data) in entries {
+            tar.extend_from_slice(&make_tar_header(name, data.len() as u64));
+            offsets.push(tar.len() as u64);
+            tar.extend_from_slice(data);
+            tar.resize(tar.len().next_multiple_of(TAR_BLOCK_SIZE), 0);
+        }
+        tar.resize(tar.len() + 2 * TAR_BLOCK_SIZE, 0);
+        (tar, offsets)
+    }
+
+    fn graph_tile(dataset_id: u64, size: usize) -> Vec<u8> {
+        let mut tile = vec![7u8; size];
+        tile[DATASET_ID_OFFSET..DATASET_ID_OFFSET + 8].copy_from_slice(&dataset_id.to_le_bytes());
+        tile
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn write_tmp(name: &str, data: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("rati-{name}-{}.tar", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn open_with_index_test() {
+        let tiles = [
+            ("2/000/818/660.gph", graph_tile(42, 300)),
+            ("0/000/529.gph", graph_tile(42, 1000)),
+        ];
+        let mut entries = vec![("index.bin", vec![0u8; tiles.len() * TILE_INDEX_ENTRY_SIZE])];
+        entries.extend(tiles.iter().cloned());
+        let (_, offsets) = make_tar(&entries);
+        let index: Vec<_> = tiles
+            .iter()
+            .zip(&offsets[1..])
+            .map(|((name, data), &offset)| {
+                (
+                    offset,
+                    TileId::from_path(name).unwrap().0,
+                    data.len() as u32,
+                )
+            })
+            .collect();
+        entries[0].1 = make_index_bin(&index);
+        let (tar, _) = make_tar(&entries);
+        let path = write_tmp("index", &tar);
+
+        let (archive, meta) = Archive::open(&path, false, None).await.unwrap();
+        assert_eq!(meta.tile_count, 2);
+        assert_eq!(&*meta.dataset_id, "42");
+        assert_eq!(archive.compression(), TileCompression::None);
+        for (name, data) in &tiles {
+            let tile = archive.get_tile(TileId::from_path(name).unwrap()).await;
+            assert_eq!(tile.unwrap().unwrap().as_ref(), data.as_slice());
+        }
+        assert!(
+            archive
+                .get_tile(TileId::new(0xDEAD))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn open_with_scan_test() {
+        let tiles = [
+            ("2/000/818/660.gph.gz", gzip(&graph_tile(42, 300))),
+            ("0/000/529.gph.gz", gzip(&graph_tile(42, 1000))),
+            ("1/047/701.gph.gz", gzip(&graph_tile(42, 2000))),
+        ];
+        let mut entries = vec![
+            ("0/", vec![]),
+            ("0/000/", vec![]),
+            ("README", b"not a tile".to_vec()),
+        ];
+        entries.extend(tiles.iter().cloned());
+        let (tar, offsets) = make_tar(&entries);
+        let path = write_tmp("scan", &tar);
+
+        assert!(Archive::open(&path, false, None).await.is_err());
+
+        let (archive, meta) = Archive::open(&path, true, None).await.unwrap();
+        assert_eq!(meta.tile_count, 3);
+        assert_eq!(&*meta.dataset_id, "42");
+        assert_eq!(archive.compression(), TileCompression::Gzip);
+
+        // Chunk sizes that are not a multiple of the tar block split headers across chunks
+        let storage = Storage::open(&path).await.unwrap();
+        for chunk_size in [512, 700, 1000, 1536, SCAN_CHUNK_SIZE] {
+            let (index, compression) = scan_tar_headers(&storage, chunk_size).await.unwrap();
+            assert_eq!(compression, TileCompression::Gzip);
+            assert_eq!(index.len(), tiles.len());
+            for ((name, data), &offset) in tiles.iter().zip(&offsets[3..]) {
+                let entry = &index[&TileId::from_path(name).unwrap()];
+                assert_eq!((entry.offset, entry.size), (offset, data.len() as u32));
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -15,9 +15,7 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — Archive location. An S3 URL (`s3://bucket/path/to/tiles.tar`), an Azure Blob
-  URL (`https://<account>.blob.core.windows.net/<container>/tiles.tar`), or a path to a local
-  `.tar` file. Anything else is treated as a local path.
+- `<archive>` — Archive location: `s3://bucket/tiles.tar`, `https://<account>.blob.core.windows.net/<container>/tiles.tar`, or a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -31,11 +29,8 @@ rati <archive> [OPTIONS]
 ### Example with Valhalla
 
 ```sh
-# Start Rati pointing at an S3 tile archive...
+# Start Rati pointing at a tile archive
 rati s3://my-bucket/valhalla/tiles.tar --port 8080
-
-# ...or at a local tar file
-rati ./tiles.tar --port 8080
 
 # Generate a Valhalla config pointing at Rati
 ./valhalla_build_config \
@@ -48,38 +43,19 @@ rati ./tiles.tar --port 8080
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
 
-### Azure Blob Storage
+## Storage Backends
+
+AWS S3 and Azure Blob Storage are supported by default. Keep only what you need, or neither for local archives only:
 
 ```sh
-rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
+cargo install rati --no-default-features --features s3
 ```
 
-The identity is picked from the standard Azure environment variables, first match wins:
+**S3** uses the default AWS credential chain (env vars, SSO, IRSA, IMDS).
 
-| Condition | Identity |
-|-----------|----------|
-| URL is `http://`, or carries a SAS (`?...&sig=...`) | none — anonymous |
-| Host is not an Azure Blob endpoint | none — anonymous |
-| `AZURE_FEDERATED_TOKEN_FILE` | workload identity (AKS) |
-| `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` | service principal |
-| `AZURE_CLIENT_ID` | user-assigned managed identity |
-| otherwise | system-assigned managed identity |
+**Azure** reads the standard `AZURE_*` environment variables: workload identity (`AZURE_FEDERATED_TOKEN_FILE`), service principal (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET`), or managed identity (`AZURE_CLIENT_ID` for a user-assigned one). A SAS in the URL works too, and `http://` URLs (e.g. Azurite) are read anonymously.
 
-An archive behind a CDN or a custom domain is reached anonymously, so it must be public or
-carry a SAS. For Azurite, point rati at `http://127.0.0.1:10000/devstoreaccount1/<container>/tiles.tar`.
-
-## Build Features
-
-| Feature | Default | Pulls in |
-|---------|---------|----------|
-| `s3` | yes | `aws-config`, `aws-sdk-s3` |
-| `azure` | yes | `azure_storage_blob`, `azure_identity` |
-
-Local archives need neither:
-
-```sh
-cargo build --release --no-default-features --features azure
-```
+Replacing the archive under a running rati makes tile reads fail with 500 instead of serving stale bytes, so restart it after uploading a new one.
 
 ## Endpoints
 
@@ -94,30 +70,14 @@ The `/tiles/{tilePath}` endpoint is directly compatible with Valhalla's `mjolnir
 
 ## Tile Path Convention
 
-Valhalla identifies tiles by a packed ID that encodes `level | (tile_index << 3)` — 3 bits for the hierarchy level, 22 bits for the tile index within a level's grid (see [`valhalla::baldr::GraphId`](https://github.com/valhalla/valhalla/blob/master/valhalla/baldr/graphid.h)).
+Valhalla tile ids encode `level | (tile_index << 3)`, and paths split the zero-padded `tile_index` into groups of 3 digits (see [`valhalla::baldr::GraphId`](https://github.com/valhalla/valhalla/blob/master/valhalla/baldr/graphid.h)):
 
-File paths are derived by zero-padding `tile_index` to the nearest multiple of 3 digits and splitting into groups of 3 separated by `/`, with the level as the first path component. This keeps directory fan-out under ~1000 entries.
-
-Examples:
 - Level 2, tile index 818660 → `2/000/818/660.gph`
 - Level 0, tile index 529 → `0/000/529.gph`
 
 ## Compression
 
-Rati negotiates the response encoding via `Accept-Encoding`. Both **gzip** and **zstd**
-are supported on the wire; when both are accepted, rati prefers zstd (better ratio at
-similar speed).
-
-Tiles inside the archive can themselves be compressed — `.gph`, `.gph.gz`, or
-`.gph.zst`. The on-disk compression is detected once at startup from the first tile's
-filename suffix (assumed uniform across the archive) and rati decompresses transparently
-when serving clients that asked for a different encoding. When the on-disk encoding
-matches what the client wants, rati passes the bytes straight through — no decode, no
-re-encode.
-
-The HEAD path advertises `Content-Length` only when the response encoding matches what's
-on disk (the only case where the index size equals the body size we'd send); otherwise
-the header is omitted rather than fetching+decoding the tile just to measure it.
+Tiles in the archive may be plain or compressed (`.gph`, `.gph.gz`, `.gph.zst`). Responses are encoded per `Accept-Encoding`, preferring zstd over gzip, and tiles are passed through as-is when the client accepts the on-disk encoding.
 
 ## CDN Headers
 
@@ -125,32 +85,22 @@ Every tile response includes headers suitable for CDN caching:
 
 | Header | Description |
 |--------|-------------|
-| `ETag` | The object or blob ETag, or synthesized `"<mtime>-<size>"` for local archives — all change whenever the archive is replaced |
-| `Last-Modified` | The object or blob last-modified timestamp, or the file's mtime for local archives |
+| `ETag` | Archive ETag, or `"<mtime>-<size>"` for local archives |
+| `Last-Modified` | Archive last-modified time |
 | `Cache-Control` | `public, max-age=<n>, immutable` — `<n>` from `--cache-max-age` (default 86400) |
 | `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or the ETag as fallback |
-| `Vary` | `Accept-Encoding` — ensures correct CDN behavior with encoding negotiation |
+| `Vary` | `Accept-Encoding` |
 | `Content-Type` | `application/octet-stream` |
 
 ## Dataset ID
 
-For graph tile archives (`.gph`), the dataset ID is automatically extracted from the `GraphTileHeader` of the first tile in the archive. This is typically the OSM changeset ID (`dataset_id_` field, a `u64` at byte offset 32 in the 272-byte header).
-
-For any other kind of archive, use `--dataset-id` to provide an explicit value. If neither works, the archive ETag is used as a fallback.
+For graph tile archives the dataset ID (typically the OSM changeset ID) is read from the `GraphTileHeader` of the first tile. Otherwise pass `--dataset-id`, or the archive ETag is used.
 
 ## Index Modes
 
-Rati supports two archive formats:
+**Tile extracts with `index.bin` (default)** — archives produced by [`valhalla_build_extract`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_extract). Startup takes a few small range reads regardless of archive size.
 
-**Tile extracts with `index.bin` (default)** — The archive contains `index.bin` as its first entry, a flat binary index where each 16-byte entry holds `(offset: u64, tile_id: u32, size: u32)` in little-endian format. This is the format produced by [`valhalla_build_extract`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_extract). At startup, Rati reads only the first tar header (512 bytes) plus the index payload — two small range requests, fast regardless of archive size.
-
-**Plain tars (`--scan-index`)** — For tar archives without `index.bin` but with files following Valhalla's [naming convention](#tile-path-convention), pass `--scan-index`. Rati scans all tar headers and indexes each filename that parses as a valid tile path. Non-tile entries are silently skipped. This requires reading the full archive at startup, so it is slower for large files.
-
-## Build
-
-```sh
-cargo build --release
-```
+**Plain tars (`--scan-index`)** — archives without `index.bin` but with files following the [tile path convention](#tile-path-convention). Rati scans all tar headers at startup, which is slow for large archives. Non-tile entries are skipped.
 
 ## License
 

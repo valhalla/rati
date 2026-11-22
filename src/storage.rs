@@ -7,7 +7,6 @@ pub mod azure;
 
 use std::sync::Arc;
 
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use bytes::Bytes;
 
 use crate::archive::Error;
@@ -201,6 +200,8 @@ fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
 /// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
 /// pieces `Archive::open` needs to read the rest.
 async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Error> {
+    use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+
     let http = aws_smithy_http_client::Builder::new()
         .tls_provider(Provider::Rustls(CryptoMode::Ring))
         .build_https();

@@ -159,6 +159,8 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, Error> {
 struct TarHeader {
     name: String,
     size: u64,
+    /// Regular file, as opposed to a directory, link or pax/GNU extension header.
+    is_file: bool,
 }
 
 impl TarHeader {
@@ -189,7 +191,13 @@ impl TarHeader {
 
         let size = octal_to_u64(&raw[124..136]);
 
-        Ok(Self { name, size })
+        let is_file = matches!(raw[156], b'0' | 0);
+
+        Ok(Self {
+            name,
+            size,
+            is_file,
+        })
     }
 }
 
@@ -414,7 +422,9 @@ async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompressi
         let data_offset = pos + TAR_BLOCK_SIZE as u64;
         let data_size = header.size;
 
-        if let Some(tile_id) = TileId::from_path(&header.name) {
+        if header.is_file
+            && let Some(tile_id) = TileId::from_path(&header.name)
+        {
             if data_size > u32::MAX as u64 {
                 tracing::warn!(
                     "Skipping tile {} ({data_size} bytes): exceeds u32::MAX size limit",

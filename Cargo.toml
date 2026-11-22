@@ -32,7 +32,6 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
-http-body = "1"
 httpdate = "1.0.3"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }

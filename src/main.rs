@@ -196,29 +196,9 @@ async fn get_tile_by_id(
     serve_tile(&state, tile_id, response_encoding).await
 }
 
-/// Body that yields nothing and reports unknown size, so hyper doesn't auto-emit
-/// `Content-Length: 0` from the size hint. Used for HEAD responses where we want
-/// to omit `Content-Length` (the index size doesn't match what GET would return).
-struct EmptyUnknownSize;
-
-impl http_body::Body for EmptyUnknownSize {
-    type Data = Bytes;
-    type Error = std::convert::Infallible;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
-        std::task::Poll::Ready(None)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::default()
-    }
-}
-
 /// Never fetches tile bytes, so `Content-Length` is set only when the index size matches
-/// the body GET would send.
+/// the body GET would send. The empty stream body has an unknown size, so hyper doesn't
+/// emit `Content-Length: 0` on its own.
 fn tile_head(
     state: &AppState,
     tile_id: archive::TileId,
@@ -228,7 +208,8 @@ fn tile_head(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let mut response = Response::new(axum::body::Body::new(EmptyUnknownSize));
+    let body = futures_util::stream::empty::<Result<Bytes, std::convert::Infallible>>();
+    let mut response = Response::new(axum::body::Body::from_stream(body));
     let h = response.headers_mut();
     if response_encoding != TileCompression::None {
         h.insert(

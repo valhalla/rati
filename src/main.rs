@@ -18,12 +18,13 @@ use tokio::signal;
 use tracing::info;
 
 mod archive;
+mod storage;
 
 use archive::TileCompression;
 
 #[derive(Parser)]
 struct Config {
-    /// Archive location: `s3://bucket/key.tar` or a local filesystem path
+    /// Archive location: `s3://bucket/key.tar`, an Azure Blob HTTPS URL, or a local path
     archive: String,
     /// Build index by scanning tar headers if index.bin is missing
     #[arg(long)]
@@ -77,7 +78,9 @@ async fn run(config: Config) {
     .expect("failed to load tar index");
     info!(
         "Loaded {} with {} tiles (dataset_id={})",
-        config.archive, meta.tile_count, meta.dataset_id,
+        storage::redact(&config.archive),
+        meta.tile_count,
+        meta.dataset_id,
     );
 
     let cache_headers = build_cache_headers(&meta, config.cache_max_age);

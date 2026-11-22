@@ -141,14 +141,17 @@ async fn get_status(State(state): State<AppState>) -> axum::Json<StatusResponse>
     axum::Json(state.status.clone())
 }
 
-/// Middleware that merges pre-built tile headers into every response.
+/// Middleware that merges pre-built tile headers into every response, except server errors
+/// that must not be cached as `immutable`.
 async fn set_cache_headers(
     State(cache_headers): State<HeaderMap>,
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().extend(cache_headers);
+    if !response.status().is_server_error() {
+        response.headers_mut().extend(cache_headers);
+    }
     response
 }
 

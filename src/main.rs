@@ -161,20 +161,10 @@ async fn get_tile(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    if is_not_modified(&headers, &state.status.etag) {
-        return StatusCode::NOT_MODIFIED.into_response();
-    }
-
     let Some(tile_id) = archive::TileId::from_path(&path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-
-    let response_encoding = pick_response_encoding(&headers, state.archive.compression());
-
-    if method == Method::HEAD {
-        return tile_head(&state, tile_id, response_encoding);
-    }
-    serve_tile(&state, tile_id, response_encoding).await
+    tile_response(method, &state, &headers, tile_id).await
 }
 
 async fn get_tile_by_id(
@@ -183,17 +173,24 @@ async fn get_tile_by_id(
     headers: HeaderMap,
     Path(tile_id): Path<u32>,
 ) -> Response {
-    if is_not_modified(&headers, &state.status.etag) {
+    tile_response(method, &state, &headers, archive::TileId::new(tile_id)).await
+}
+
+async fn tile_response(
+    method: Method,
+    state: &AppState,
+    headers: &HeaderMap,
+    tile_id: archive::TileId,
+) -> Response {
+    if is_not_modified(headers, &state.status.etag) {
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let tile_id = archive::TileId::new(tile_id);
-    let response_encoding = pick_response_encoding(&headers, state.archive.compression());
-
+    let response_encoding = pick_response_encoding(headers, state.archive.compression());
     if method == Method::HEAD {
-        return tile_head(&state, tile_id, response_encoding);
+        return tile_head(state, tile_id, response_encoding);
     }
-    serve_tile(&state, tile_id, response_encoding).await
+    serve_tile(state, tile_id, response_encoding).await
 }
 
 /// Never fetches tile bytes, so `Content-Length` is set only when the index size matches

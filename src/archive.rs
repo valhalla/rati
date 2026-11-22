@@ -15,7 +15,7 @@
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
-use crate::storage::{ArchiveSource, Storage};
+use crate::storage::Storage;
 
 const TAR_BLOCK_SIZE: usize = 512;
 const TILE_INDEX_ENTRY_SIZE: usize = 16;
@@ -248,18 +248,11 @@ impl Archive {
         scan_index: bool,
         dataset_id_override: Option<&str>,
     ) -> Result<(Self, ArchiveMeta), Error> {
-        let (storage, src) = Storage::open(source).await?;
-        let ArchiveSource {
-            etag,
-            last_modified,
-            size: archive_size,
-            prefetch,
-        } = src;
+        let storage = Storage::open(source).await?;
+        let etag = storage.etag.clone();
+        let last_modified = storage.last_modified.clone();
 
-        let header_bytes = match prefetch {
-            Some(bytes) if bytes.len() >= TAR_BLOCK_SIZE => bytes.slice(0..TAR_BLOCK_SIZE),
-            _ => storage.read_range(0, TAR_BLOCK_SIZE as u64).await?,
-        };
+        let header_bytes = storage.read_range(0, TAR_BLOCK_SIZE as u64).await?;
         let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
             .as_ref()
             .try_into()
@@ -277,7 +270,7 @@ impl Archive {
                     "index.bin not found in archive; scanning tar headers to build index \
                      via range reads."
                 );
-                scan_tar_headers(&storage, archive_size).await?
+                scan_tar_headers(&storage).await?
             }
             Err(TarError::FirstEntryNotIndex { .. }) => {
                 return Err(Error::Tar(TarError::MissingIndexNoScan));
@@ -362,11 +355,10 @@ pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<
 }
 
 /// Reads the archive in 8 MB chunks with up to `PREFETCH` in flight, parsing only tar headers.
-async fn scan_tar_headers(
-    storage: &Storage,
-    archive_size: u64,
-) -> Result<(TileIndex, TileCompression), Error> {
+async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompression), Error> {
     use futures_util::{StreamExt, stream};
+
+    let archive_size = storage.size;
 
     // Full planet tileset might have up to 205k tiles and occupy ~80GB, so making
     // ~10k chunk reads (with prefetch) is much faster than 205k sequential header reads.

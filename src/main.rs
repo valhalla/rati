@@ -214,14 +214,8 @@ impl http_body::Body for EmptyUnknownSize {
     }
 }
 
-/// HEAD: never fetch tile bytes. Set `Content-Encoding` for compressed responses,
-/// and advertise `Content-Length` only when the response encoding matches what's
-/// already on disk — that's the only case where the index size equals the body size
-/// we'd send.
-///
-/// The body is [`EmptyUnknownSize`] rather than [`axum::body::Body::empty`] so hyper
-/// doesn't auto-emit `Content-Length: 0` from the body's exact size hint when we
-/// deliberately want the header omitted.
+/// Never fetches tile bytes, so `Content-Length` is set only when the index size matches
+/// the body GET would send.
 fn tile_head(
     state: &AppState,
     tile_id: archive::TileId,
@@ -245,8 +239,6 @@ fn tile_head(
     response
 }
 
-/// GET: fetch the tile and produce bytes in the negotiated encoding. Pass-through when
-/// the on-disk encoding already matches; otherwise decompress to plain and re-encode.
 async fn serve_tile(
     state: &AppState,
     tile_id: archive::TileId,
@@ -289,13 +281,7 @@ async fn serve_tile(
     response
 }
 
-/// Pick the response encoding from `Accept-Encoding` and the on-disk compression.
-///
-/// Single pass over the header populates `(zstd_ok, gzip_ok)`; the decision then
-/// mirrors the negotiation table:
-/// - Source matches an accepted encoding → pass through (no decode, no re-encode).
-/// - Otherwise pick the best accepted encoding, preferring zstd over gzip.
-/// - Nothing matches → plain.
+/// Pass through the on-disk encoding if accepted, otherwise prefer zstd over gzip.
 fn pick_response_encoding(headers: &HeaderMap, source: TileCompression) -> TileCompression {
     use TileCompression::*;
 

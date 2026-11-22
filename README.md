@@ -54,9 +54,7 @@ See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/s
 rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
 ```
 
-There are no Azure flags. The identity is chosen from the environment, using the same
-variables every Azure SDK reads, in the order `DefaultAzureCredential` uses elsewhere — the
-first row that matches wins:
+The identity is picked from the standard Azure environment variables, first match wins:
 
 | Condition | Identity |
 |-----------|----------|
@@ -67,17 +65,8 @@ first row that matches wins:
 | `AZURE_CLIENT_ID` | user-assigned managed identity |
 | otherwise | system-assigned managed identity |
 
-Three rati-specific notes:
-
-- A bearer token is only ever sent to an `https` Azure Blob host. An archive behind a CDN,
-  Front Door, or a storage-account custom domain is reached anonymously, so it must be
-  public or the URL must carry a SAS.
-- Plaintext (`http://`) endpoints are always anonymous — rati will not put a bearer token on
-  the wire in the clear. Azurite therefore needs no configuration at all; point rati at
-  `http://127.0.0.1:10000/devstoreaccount1/valhalla/tiles.tar`. For local development against
-  real blob storage, use a service principal or a SAS.
-- Do not set `Content-Encoding` on the archive blob. A blob-level encoding confuses CDNs and
-  proxies in front of rati.
+An archive behind a CDN or a custom domain is reached anonymously, so it must be public or
+carry a SAS. For Azurite, point rati at `http://127.0.0.1:10000/devstoreaccount1/<container>/tiles.tar`.
 
 ## Build Features
 
@@ -86,7 +75,7 @@ Three rati-specific notes:
 | `s3` | yes | `aws-config`, `aws-sdk-s3` |
 | `azure` | yes | `azure_storage_blob`, `azure_identity` |
 
-Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
+Local archives need neither:
 
 ```sh
 cargo build --release --no-default-features --features azure

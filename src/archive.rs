@@ -17,11 +17,8 @@ use rustc_hash::FxHashMap;
 
 use crate::storage::{ArchiveSource, Storage};
 
-/// Size of a POSIX tar header block.
 const TAR_BLOCK_SIZE: usize = 512;
-/// Size of a single index entry in bytes: u64 + u32 + u32.
 const TILE_INDEX_ENTRY_SIZE: usize = 16;
-/// Name of the index file that must be the first entry in the tar.
 const TILE_INDEX_FILE_NAME: &str = "index.bin";
 
 /// Byte offset of `dataset_id_` (`u64`) within Valhalla's `GraphTileHeader`.
@@ -78,10 +75,7 @@ impl TileCompression {
         }
     }
 
-    /// IANA token used on the wire in `Accept-Encoding` / `Content-Encoding`.
-    /// [`Self::None`] returns the conventional `"identity"`; callers emitting
-    /// `Content-Encoding` should suppress the header in that case rather than
-    /// sending `identity` (which is redundant).
+    /// IANA token used in `Accept-Encoding` / `Content-Encoding`.
     pub const fn header_name(self) -> &'static str {
         match self {
             Self::None => "identity",
@@ -93,8 +87,6 @@ impl TileCompression {
 
 impl std::fmt::Display for TileCompression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Use a friendlier label for `None` in logs; the HTTP token is "identity"
-        // (see [`Self::header_name`]) but reads oddly outside an HTTP context.
         f.write_str(match self {
             Self::None => "none",
             other => other.header_name(),
@@ -117,8 +109,6 @@ struct TileIndexEntry {
 }
 
 impl TileIndexEntry {
-    /// Parse a single entry from a 16-byte little-endian slice.
-    /// Matches the https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_extract
     fn from_bytes(data: &[u8; TILE_INDEX_ENTRY_SIZE]) -> Self {
         Self {
             offset: u64::from_le_bytes(data[0..8].try_into().unwrap()),
@@ -136,7 +126,6 @@ struct TileEntry {
 
 type TileIndex = FxHashMap<TileId, TileEntry>;
 
-/// Parse index from raw `index.bin` bytes.
 fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
     if !data.len().is_multiple_of(TILE_INDEX_ENTRY_SIZE) {
         return Err(TarError::InvalidIndexSize {
@@ -166,11 +155,7 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
     Ok(entries)
 }
 
-/// Parse the first tar header from raw bytes and extract the index.bin file content range.
-///
-/// Returns `(data_offset, data_size)` — the byte range within the archive where `index.bin`
-/// content lives. The caller should read `archive[data_offset..data_offset + data_size]` to
-/// get the raw index data, then pass it to [`parse_index`].
+/// Returns `(data_offset, data_size)` of `index.bin` within the archive.
 fn read_index_header(header_bytes: &[u8; TAR_BLOCK_SIZE]) -> Result<(u64, u64), TarError> {
     let header = TarHeader::parse(header_bytes)?;
 
@@ -187,10 +172,7 @@ fn read_index_header(header_bytes: &[u8; TAR_BLOCK_SIZE]) -> Result<(u64, u64), 
     Ok((data_offset, data_size))
 }
 
-/// Minimal POSIX tar header parser.
-///
-/// Only extracts fields we need: `name` and `size`. Verifies the header checksum
-/// following the same algorithm as `tar::header_t::verify()` in `sequence.h:638-651`.
+/// Minimal POSIX tar header parser, mirrors `tar::header_t` in `sequence.h`.
 struct TarHeader {
     name: String,
     size: u64,
@@ -198,8 +180,7 @@ struct TarHeader {
 
 impl TarHeader {
     fn parse(raw: &[u8; TAR_BLOCK_SIZE]) -> Result<Self, TarError> {
-        // Verify checksum (sequence.h:638-651)
-        // The checksum is computed over the entire header with the chksum field treated as spaces
+        // The checksum is computed with the chksum field treated as spaces (sequence.h:638-651)
         let stored_checksum = octal_to_u64(&raw[148..156]);
         let mut unsigned_sum = 0u64;
         let mut signed_sum = 0i64;
@@ -216,31 +197,25 @@ impl TarHeader {
             return Err(TarError::InvalidHeader("checksum mismatch".into()));
         }
 
-        // Extract null-terminated name (first 100 bytes)
         let name_end = raw[..100].iter().position(|&b| b == 0).unwrap_or(100);
         let name = std::str::from_utf8(&raw[..name_end])
             .map_err(|_| TarError::InvalidHeader("name is not valid UTF-8".into()))?
             .to_string();
 
-        // Extract size (octal ASCII in bytes 124-136)
         let size = octal_to_u64(&raw[124..136]);
 
         Ok(Self { name, size })
     }
 }
 
-/// Parse an octal ASCII field from a tar header, handling trailing NULs and spaces.
-///
 /// Mirrors `tar::header_t::octal_to_int()` in `sequence.h:610-627`.
 fn octal_to_u64(field: &[u8]) -> u64 {
-    // Find the end of meaningful content (skip trailing NULs and spaces)
     let end = field
         .iter()
         .rposition(|&b| b != 0 && b != b' ')
         .map(|i| i + 1)
         .unwrap_or(0);
 
-    // Parse octal digits
     let mut result = 0u64;
     for &byte in &field[..end] {
         if (b'0'..=b'7').contains(&byte) {
@@ -253,13 +228,9 @@ fn octal_to_u64(field: &[u8]) -> u64 {
 
 /// Metadata consumed once at startup: logging, tile headers, status endpoint.
 pub struct ArchiveMeta {
-    /// Source ETag — S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives.
     pub etag: Box<str>,
-    /// Source Last-Modified as an HTTP-date string.
     pub last_modified: Box<str>,
-    /// Dataset identifier: extracted from graph tile header, CLI override, or ETag fallback.
     pub dataset_id: Box<str>,
-    /// Number of tiles in the index.
     pub tile_count: usize,
 }
 
@@ -270,18 +241,8 @@ pub struct Archive {
 }
 
 impl Archive {
-    /// Connect to the archive and load the tar index.
-    ///
-    /// `source` is an S3 URL (`s3://bucket/key`), an Azure Blob HTTPS URL, or a local
-    /// filesystem path — see [`crate::storage`] for how each is opened and authenticated.
-    ///
     /// If the first tar entry is not `index.bin` and `scan_index` is true, falls back
-    /// to scanning tar headers to build the index — slow for large archives, since tar
-    /// has no central directory.
-    ///
-    /// `dataset_id_override` — if provided, used as the dataset ID instead of auto-detection.
-    ///
-    /// Returns the archive (for tile fetches) and metadata (consumed once at startup).
+    /// to scanning tar headers - slow for large archives, since tar has no central directory.
     pub async fn open(
         source: &str,
         scan_index: bool,
@@ -295,8 +256,6 @@ impl Archive {
             prefetch,
         } = src;
 
-        // Step 1: the first 512-byte tar header, reusing it if the backend already
-        // read it while fetching metadata.
         let header_bytes = match prefetch {
             Some(bytes) if bytes.len() >= TAR_BLOCK_SIZE => bytes.slice(0..TAR_BLOCK_SIZE),
             _ => storage.read_range(0, TAR_BLOCK_SIZE as u64).await?,
@@ -306,10 +265,6 @@ impl Archive {
             .try_into()
             .map_err(|_| Error::Protocol("tar header shorter than 512 bytes".into()))?;
 
-        // Step 2: Try to load index.bin; fall back to tar scan if missing and --scan-index is set.
-        // The scan path sees filenames directly and detects compression inline; the index.bin
-        // path requires an extra 512-byte range read afterwards to read the first tile's
-        // tar header.
         let (index, compression) = match read_index_header(header) {
             Ok((data_offset, data_size)) => {
                 let index_bytes = storage.read_range(data_offset, data_size).await?;
@@ -332,19 +287,16 @@ impl Archive {
 
         tracing::info!("Tile compression: {compression}");
 
-        // Step 3: Determine the dataset ID
         let dataset_id: Box<str> = if let Some(override_id) = dataset_id_override {
             tracing::info!("Using CLI-provided dataset ID: {override_id}");
             override_id.into()
         } else {
-            // Try to auto-detect from the first tile's GraphTileHeader
             match detect_dataset_id(&storage, &index, compression).await {
                 Ok(id) => {
                     tracing::info!("Auto-detected dataset ID from graph tile header: {id}");
                     id.to_string().into()
                 }
                 Err(e) => {
-                    // Fall back to ETag
                     tracing::warn!(
                         "Could not detect dataset ID from tile header ({e}); \
                          falling back to ETag: {etag}"
@@ -372,9 +324,7 @@ impl Archive {
         Ok((archive, meta))
     }
 
-    /// Fetch a tile's on-disk bytes — exactly what's stored in the tar, compressed or not.
-    /// Callers inspect [`compression`](Self::compression) to decide whether to decode.
-    /// Returns `None` if the tile is not in the index.
+    /// On-disk tile bytes, compressed as [`Self::compression`].
     pub async fn get_tile(&self, tile_id: TileId) -> Result<Option<Bytes>, Error> {
         let Some(entry) = self.index.get(&tile_id) else {
             return Ok(None);
@@ -386,19 +336,16 @@ impl Archive {
         Ok(Some(raw))
     }
 
-    /// Returns the on-disk tile size from the index, or `None` if the tile doesn't exist.
-    /// For compressed archives this is the compressed size, not the size the client receives.
+    /// On-disk size, i.e. compressed size for compressed archives.
     pub fn tile_size(&self, tile_id: TileId) -> Option<u32> {
         self.index.get(&tile_id).map(|e| e.size)
     }
 
-    /// Compression scheme used for tiles inside this archive.
     pub fn compression(&self) -> TileCompression {
         self.compression
     }
 }
 
-/// Decompress `data` according to `compression`. Returns the input unchanged for `TileCompression::None`.
 pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<Bytes> {
     use std::io::Read;
     match compression {
@@ -414,12 +361,7 @@ pub fn decompress(data: Bytes, compression: TileCompression) -> std::io::Result<
     }
 }
 
-/// Scan tar headers via the storage backend to build the tile index.
-///
-/// Reads the archive in fixed-offset 8 MB chunks, parsing only the 512-byte tar
-/// headers and skipping over tile data. Up to `PREFETCH` chunks are in-flight
-/// concurrently (via [`futures_util::StreamExt::buffered`]), so the next chunk is
-/// typically ready by the time the scanner finishes the current one.
+/// Reads the archive in 8 MB chunks with up to `PREFETCH` in flight, parsing only tar headers.
 async fn scan_tar_headers(
     storage: &Storage,
     archive_size: u64,
@@ -444,7 +386,6 @@ async fn scan_tar_headers(
     let mut compression = TileCompression::None;
     let mut pos: u64 = 0;
 
-    // Current chunk and its position within the archive
     let mut chunk = Bytes::new();
     let mut chunk_start: u64 = 0;
     let mut next_chunk_idx: u64 = 0;
@@ -484,7 +425,6 @@ async fn scan_tar_headers(
             &header_buf
         };
 
-        // End-of-archive marker (zero block)
         if header_array.iter().all(|&b| b == 0) {
             break;
         }
@@ -531,10 +471,7 @@ async fn scan_tar_headers(
     Ok((entries, compression))
 }
 
-/// Read the tar header of the first tile listed in `index` and detect compression from its name.
-///
-/// Index entries store only `tile_id`, not filenames, so we need one additional 512-byte read
-/// to recover the name. The tar header sits 512 bytes before the tile data.
+/// Index entries have no filenames, so read the first tile's tar header to get one.
 async fn detect_compression(
     storage: &Storage,
     index: &TileIndex,
@@ -553,14 +490,8 @@ async fn detect_compression(
     Ok(TileCompression::from_name(&parsed.name))
 }
 
-/// Try to detect the dataset ID by reading the first tile's `GraphTileHeader`.
-///
-/// Picks an arbitrary tile from the index, reads its first 272 bytes (the header),
-/// and extracts the `dataset_id` field (`u64` at byte offset 32). For compressed
-/// archives the whole tile is fetched and decompressed first.
-///
-/// Returns an error if no tiles are in the index, the tile is too small, or
-/// the `dataset_id` field is zero (likely not a graph tile).
+/// Read `dataset_id` from the `GraphTileHeader` of an arbitrary tile. Zero means it's
+/// likely not a graph tile.
 async fn detect_dataset_id(
     storage: &Storage,
     index: &TileIndex,
@@ -601,10 +532,6 @@ async fn detect_dataset_id(
     Ok(dataset_id)
 }
 
-/// Extract `dataset_id` from a raw `GraphTileHeader` byte slice.
-///
-/// The `dataset_id_` field is a little-endian `u64` at byte offset 32 within the
-/// 272-byte header.
 fn parse_dataset_id(header: &[u8]) -> Result<u64, Error> {
     if header.len() < DATASET_ID_OFFSET + 8 {
         return Err(Error::Protocol(format!(
@@ -654,7 +581,6 @@ mod tests {
     use super::*;
     use std::assert_matches;
 
-    /// Build a minimal tar header for a file with the given name and size.
     fn make_tar_header(name: &str, size: u64) -> [u8; TAR_BLOCK_SIZE] {
         let mut header = [0u8; TAR_BLOCK_SIZE];
 
@@ -689,7 +615,6 @@ mod tests {
         header
     }
 
-    /// Build index.bin content from a slice of (offset, tile_id, size) tuples.
     fn make_index_bin(entries: &[(u64, u32, u32)]) -> Vec<u8> {
         let mut data = Vec::with_capacity(entries.len() * TILE_INDEX_ENTRY_SIZE);
         for &(offset, tile_id, size) in entries {

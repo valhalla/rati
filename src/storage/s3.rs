@@ -3,8 +3,7 @@ use aws_sdk_s3::primitives::DateTimeFormat;
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use bytes::Bytes;
 
-use super::{Backend, Storage};
-use crate::archive::Error;
+use super::{Backend, Error, Storage};
 
 pub(super) async fn open(bucket: &str, key: &str) -> Result<Storage, Error> {
     let http = aws_smithy_http_client::Builder::new()

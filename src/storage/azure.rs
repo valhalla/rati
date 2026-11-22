@@ -12,8 +12,7 @@ use azure_storage_blob::BlobClient;
 use azure_storage_blob::models::{BlobClientDownloadOptions, HttpRange};
 use bytes::Bytes;
 
-use super::{Backend, Storage, redact};
-use crate::archive::Error;
+use super::{Backend, Error, Storage, redact};
 
 // The SDK keeps its own `ContentRange` type private
 const CONTENT_RANGE: HeaderName = HeaderName::from_static("content-range");

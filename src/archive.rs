@@ -15,7 +15,7 @@
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
-use crate::storage::Storage;
+use crate::storage::{Error, Storage};
 
 const TAR_BLOCK_SIZE: usize = 512;
 const TILE_INDEX_ENTRY_SIZE: usize = 16;
@@ -126,12 +126,12 @@ struct TileEntry {
 
 type TileIndex = FxHashMap<TileId, TileEntry>;
 
-fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
+fn parse_index(data: &[u8]) -> Result<TileIndex, Error> {
     if !data.len().is_multiple_of(TILE_INDEX_ENTRY_SIZE) {
-        return Err(TarError::InvalidIndexSize {
-            size: data.len(),
-            entry_size: TILE_INDEX_ENTRY_SIZE,
-        });
+        return Err(Error::Protocol(format!(
+            "index.bin size {} is not a multiple of entry size {TILE_INDEX_ENTRY_SIZE}",
+            data.len()
+        )));
     }
 
     let count = data.len() / TILE_INDEX_ENTRY_SIZE;
@@ -149,27 +149,10 @@ fn parse_index(data: &[u8]) -> Result<TileIndex, TarError> {
     }
 
     if entries.is_empty() {
-        return Err(TarError::EmptyIndex);
+        return Err(Error::Protocol("index.bin is empty".into()));
     }
 
     Ok(entries)
-}
-
-/// Returns `(data_offset, data_size)` of `index.bin` within the archive.
-fn read_index_header(header_bytes: &[u8; TAR_BLOCK_SIZE]) -> Result<(u64, u64), TarError> {
-    let header = TarHeader::parse(header_bytes)?;
-
-    // The first entry must be index.bin — graphreader.cc:147 enforces this
-    if header.name != TILE_INDEX_FILE_NAME {
-        return Err(TarError::FirstEntryNotIndex {
-            actual: header.name,
-        });
-    }
-
-    let data_offset = TAR_BLOCK_SIZE as u64; // data starts right after the 512-byte header
-    let data_size = header.size;
-
-    Ok((data_offset, data_size))
 }
 
 /// Minimal POSIX tar header parser, mirrors `tar::header_t` in `sequence.h`.
@@ -179,7 +162,7 @@ struct TarHeader {
 }
 
 impl TarHeader {
-    fn parse(raw: &[u8; TAR_BLOCK_SIZE]) -> Result<Self, TarError> {
+    fn parse(raw: &[u8; TAR_BLOCK_SIZE]) -> Result<Self, Error> {
         // The checksum is computed with the chksum field treated as spaces (sequence.h:638-651)
         let stored_checksum = octal_to_u64(&raw[148..156]);
         let mut unsigned_sum = 0u64;
@@ -194,12 +177,14 @@ impl TarHeader {
             signed_sum += (b as i8) as i64;
         }
         if stored_checksum != unsigned_sum && stored_checksum as i64 != signed_sum {
-            return Err(TarError::InvalidHeader("checksum mismatch".into()));
+            return Err(Error::Protocol(
+                "invalid tar header: checksum mismatch".into(),
+            ));
         }
 
         let name_end = raw[..100].iter().position(|&b| b == 0).unwrap_or(100);
         let name = std::str::from_utf8(&raw[..name_end])
-            .map_err(|_| TarError::InvalidHeader("name is not valid UTF-8".into()))?
+            .map_err(|_| Error::Protocol("invalid tar header: name is not valid UTF-8".into()))?
             .to_string();
 
         let size = octal_to_u64(&raw[124..136]);
@@ -258,24 +243,27 @@ impl Archive {
             .try_into()
             .map_err(|_| Error::Protocol("tar header shorter than 512 bytes".into()))?;
 
-        let (index, compression) = match read_index_header(header) {
-            Ok((data_offset, data_size)) => {
-                let index_bytes = storage.read_range(data_offset, data_size).await?;
-                let index = parse_index(&index_bytes).map_err(Error::Tar)?;
-                let compression = detect_compression(&storage, &index).await?;
-                (index, compression)
-            }
-            Err(TarError::FirstEntryNotIndex { .. }) if scan_index => {
-                tracing::warn!(
-                    "index.bin not found in archive; scanning tar headers to build index \
-                     via range reads."
-                );
-                scan_tar_headers(&storage).await?
-            }
-            Err(TarError::FirstEntryNotIndex { .. }) => {
-                return Err(Error::Tar(TarError::MissingIndexNoScan));
-            }
-            Err(e) => return Err(Error::Tar(e)),
+        let header = TarHeader::parse(header)?;
+        // The first entry must be index.bin — graphreader.cc:147 enforces this
+        let (index, compression) = if header.name == TILE_INDEX_FILE_NAME {
+            let index_bytes = storage
+                .read_range(TAR_BLOCK_SIZE as u64, header.size)
+                .await?;
+            let index = parse_index(&index_bytes)?;
+            let compression = detect_compression(&storage, &index).await?;
+            (index, compression)
+        } else if scan_index {
+            tracing::warn!(
+                "index.bin not found in archive; scanning tar headers to build index \
+                 via range reads."
+            );
+            scan_tar_headers(&storage).await?
+        } else {
+            return Err(Error::Protocol(format!(
+                "first tar entry is '{}', not 'index.bin'; re-run with --scan-index to build \
+                 index from tar headers",
+                header.name
+            )));
         };
 
         tracing::info!("Tile compression: {compression}");
@@ -421,7 +409,7 @@ async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompressi
             break;
         }
 
-        let header = TarHeader::parse(header_array).map_err(Error::Tar)?;
+        let header = TarHeader::parse(header_array)?;
 
         let data_offset = pos + TAR_BLOCK_SIZE as u64;
         let data_size = header.size;
@@ -455,7 +443,7 @@ async fn scan_tar_headers(storage: &Storage) -> Result<(TileIndex, TileCompressi
     }
 
     if entries.is_empty() {
-        return Err(Error::Tar(TarError::EmptyIndex));
+        return Err(Error::Protocol("no tiles found in the archive".into()));
     }
     entries.shrink_to_fit();
 
@@ -478,7 +466,7 @@ async fn detect_compression(
         .as_ref()
         .try_into()
         .map_err(|_| Error::Protocol("tile header shorter than 512 bytes".into()))?;
-    let parsed = TarHeader::parse(header).map_err(Error::Tar)?;
+    let parsed = TarHeader::parse(header)?;
     Ok(TileCompression::from_name(&parsed.name))
 }
 
@@ -538,40 +526,9 @@ fn parse_dataset_id(header: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TarError {
-    #[error("index.bin size {size} is not a multiple of entry size {entry_size}")]
-    InvalidIndexSize { size: usize, entry_size: usize },
-
-    #[error("index.bin is empty")]
-    EmptyIndex,
-
-    #[error("first tar entry must be 'index.bin', got '{actual}'")]
-    FirstEntryNotIndex { actual: String },
-
-    #[error("archive has no index.bin; re-run with --scan-index to build index from tar headers")]
-    MissingIndexNoScan,
-
-    #[error("invalid tar header: {0}")]
-    InvalidHeader(String),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("I/O error: {0}")]
-    Io(String),
-
-    #[error("{0}")]
-    Protocol(String),
-
-    #[error(transparent)]
-    Tar(TarError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
 
     fn make_tar_header(name: &str, size: u64) -> [u8; TAR_BLOCK_SIZE] {
         let mut header = [0u8; TAR_BLOCK_SIZE];
@@ -653,18 +610,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_index_header() {
-        let header = make_tar_header("index.bin", 48); // 3 entries x 16 bytes
-        let (offset, size) = read_index_header(&header).unwrap();
-        assert_eq!(offset, 512);
-        assert_eq!(size, 48);
-    }
+    fn tar_header_test() {
+        let header = TarHeader::parse(&make_tar_header("index.bin", 48)).unwrap();
+        assert_eq!(header.name, "index.bin");
+        assert_eq!(header.size, 48);
 
-    #[test]
-    fn reject_non_index_first_entry() {
-        let header = make_tar_header("0/000/529.gph", 1024);
-        let err = read_index_header(&header).unwrap_err();
-        assert_matches!(err, TarError::FirstEntryNotIndex { .. });
+        let mut corrupted = make_tar_header("index.bin", 48);
+        corrupted[0] = b'X';
+        assert!(TarHeader::parse(&corrupted).is_err());
     }
 
     #[test]
@@ -736,14 +689,12 @@ mod tests {
     #[test]
     fn reject_invalid_index_size() {
         let data = vec![0u8; 17]; // not a multiple of 16
-        let err = parse_index(&data).unwrap_err();
-        assert_matches!(err, TarError::InvalidIndexSize { .. });
+        assert!(parse_index(&data).is_err());
     }
 
     #[test]
     fn reject_empty_index() {
-        let err = parse_index(&[]).unwrap_err();
-        assert_matches!(err, TarError::EmptyIndex);
+        assert!(parse_index(&[]).is_err());
     }
 
     #[test]

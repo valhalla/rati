@@ -7,7 +7,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::archive::Error;
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("{0}")]
+    Protocol(String),
+}
 
 pub struct Storage {
     pub etag: Box<str>,

@@ -51,11 +51,13 @@ AWS S3 and Azure Blob Storage are supported by default. Keep only what you need,
 cargo install rati --no-default-features --features s3
 ```
 
+**Local** paths are always supported and need no feature.
+
 **S3** uses the default AWS credential chain (env vars, SSO, IRSA, IMDS).
 
 **Azure** reads the standard `AZURE_*` environment variables: workload identity (`AZURE_FEDERATED_TOKEN_FILE`), service principal (`AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET`), or managed identity (`AZURE_CLIENT_ID` for a user-assigned one). A SAS in the URL works too, and `http://` URLs (e.g. Azurite) are read anonymously.
 
-Replacing the archive under a running rati makes tile reads fail with 500 instead of serving stale bytes, so restart it after uploading a new one.
+Restart rati after replacing the archive. S3 and Azure reads fail with 500 until then instead of serving stale bytes. A local archive replaced via rename keeps being served from the old file, while one overwritten in place serves corrupted tiles.
 
 ## Endpoints
 

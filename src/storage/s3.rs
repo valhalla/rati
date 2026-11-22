@@ -5,7 +5,11 @@ use bytes::Bytes;
 
 use super::{Backend, Error, Storage};
 
-pub(super) async fn open(bucket: &str, key: &str) -> Result<Storage, Error> {
+pub(super) async fn open(url: &str) -> Result<Storage, Error> {
+    let (bucket, key) = parse_url(url).ok_or_else(|| {
+        Error::Protocol(format!("invalid S3 URL {url}, expected s3://bucket/key"))
+    })?;
+
     let http = aws_smithy_http_client::Builder::new()
         .tls_provider(Provider::Rustls(CryptoMode::Ring))
         .build_https();
@@ -75,4 +79,32 @@ pub(super) async fn read_range(
         .map_err(|e| Error::Io(format!("reading S3 response body: {e}")))?
         .into_bytes();
     Ok(data)
+}
+
+fn parse_url(url: &str) -> Option<(&str, &str)> {
+    let path = url.strip_prefix("s3://")?;
+    path.split_once('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_url_test() {
+        assert_eq!(
+            parse_url("s3://my-bucket/path/to/file.tar"),
+            Some(("my-bucket", "path/to/file.tar"))
+        );
+        assert_eq!(
+            parse_url("s3://bucket/file.tar"),
+            Some(("bucket", "file.tar"))
+        );
+
+        assert_eq!(parse_url("bucket/key"), None);
+        assert_eq!(parse_url("https://wrong/scheme"), None);
+        assert_eq!(parse_url("s3:/bad-url/format"), None);
+        assert_eq!(parse_url("s3://bucket-only"), None);
+        assert_eq!(parse_url("s3://file-only.tar"), None);
+    }
 }

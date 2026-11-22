@@ -1,16 +1,7 @@
-//! Tar archive index parsing and tile lookups, reading bytes through a [`Storage`] backend.
-//!
-//! Loads the tar index via a handful of small range reads — no full download:
-//!
-//! 1. Source metadata from the backend — see [`crate::storage`].
-//! 2. First 512 bytes — the leading tar header, expected to name `index.bin`. If it
-//!    doesn't and `--scan-index` is set, fall back to [`scan_tar_headers`] which walks
-//!    the whole archive in 8 MB chunks with prefetch.
-//! 3. The `index.bin` payload — parsed into a `TileId → (offset, size)` map.
-//! 4. One more 512-byte header read to detect tile compression from the first tile's
-//!    filename suffix ([`detect_compression`]).
-//! 5. A 272-byte read (or the full first tile when it's compressed) to extract the
-//!    dataset id from the `GraphTileHeader` ([`detect_dataset_id`]).
+//! Valhalla tile archive. Opening it takes a few small range reads, not a full download:
+//! the `index.bin` header and payload, then the first tile's tar header and `GraphTileHeader`
+//! to detect compression and dataset id. Without `index.bin`, `--scan-index` reads all tar
+//! headers instead.
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;

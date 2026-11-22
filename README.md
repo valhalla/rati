@@ -102,6 +102,10 @@ For graph tile archives the dataset ID (typically the OSM changeset ID) is read 
 
 **Plain tars (`--scan-index`)** — archives without `index.bin` but with files following the [tile path convention](#tile-path-convention). Rati scans all tar headers at startup, which is slow for large archives. Non-tile entries are skipped.
 
+## Contributing
+
+Contributions are welcome, including AI-assisted ones. Rati is meant to stay small and readable, so follow the existing style and architecture. Low-effort issues and PRs that don't will be closed without warning.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.

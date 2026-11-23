@@ -8,7 +8,8 @@ WORKDIR /usr/src/app
 # First build a dummy target to cache dependencies in a separate Docker layer
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() { println!("Dummy image called!"); }' > src/main.rs
-RUN cargo build --release
+# Silence warning about every dependecy being unused
+RUN CARGO_BUILD_WARNINGS=allow cargo build --release
 
 # Now build the real target
 COPY src ./src
